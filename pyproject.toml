@@ -1,0 +1,17 @@
+[project]
+name = "dzq"
+version = "0.1.0"
+description = "大周期散户决策：资金行为打分 → 仓位决策 → 网页报告"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pandas>=2.0",
+  "numpy>=1.24",
+  "duckdb>=0.10",
+  "akshare>=1.12",
+  "requests>=2.28",
+  "matplotlib>=3.7",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

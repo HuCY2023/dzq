@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+output/
+*.duckdb
+*.duckdb.wal
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/

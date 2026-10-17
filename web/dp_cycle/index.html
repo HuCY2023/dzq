@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>大周期五项指标</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="lightweight-charts.js"></script>
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="title">大周期 · 散户决策</div>
+        <div class="sub" id="subtitle">盯其他几路资金 · 打分 · 离场/减仓/持有/加仓/抄底</div>
+      </div>
+      <div class="legend" id="hoverTime">十字线：—</div>
+      <div class="pane-tools" id="paneNav">
+        <nav class="pane-nav" aria-label="图定位">
+          <button type="button" data-pane="pane-weekly">周线</button>
+          <button type="button" data-pane="pane-score">打分</button>
+          <button type="button" data-pane="pane-mf-m">主力月</button>
+          <button type="button" data-pane="pane-mf-w">主力周</button>
+          <button type="button" data-pane="pane-nb">北向</button>
+          <button type="button" data-pane="pane-etf">郭嘉队ETF</button>
+          <button type="button" data-pane="pane-margin">融资</button>
+          <button type="button" data-pane="pane-gv">偏离</button>
+          <button type="button" data-pane="pane-hl">广度</button>
+          <button type="button" data-pane="pane-unlock-m">解禁月</button>
+          <button type="button" data-pane="pane-unlock-q">解禁季</button>
+        </nav>
+        <button type="button" data-reset="1">近5年</button>
+      </div>
+    </header>
+
+    <div class="quality" id="qualityBar" aria-live="polite">
+      <div class="quality-summary" id="qualitySummary">等待加载…</div>
+      <div class="quality-badges" id="qualityBadges"></div>
+    </div>
+    <section class="diagnosis" id="diagnosisBar" aria-live="polite">
+      <div class="verdict-row">
+        <div class="verdict-main">
+          <div class="diag-kicker" id="diagFramework">散户决策</div>
+          <div class="decision-label" id="decisionLabel">等待加载…</div>
+          <div class="decision-equity" id="decisionEquity"></div>
+          <div class="decision-why" id="decisionWhy"></div>
+          <div class="decision-scale" id="decisionScale"></div>
+          <div class="diag-state" id="diagState"></div>
+          <div class="diag-summary" id="diagSummary"></div>
+        </div>
+        <div class="verdict-score" id="verdictScore">
+          <div class="score-cap">汇总得分</div>
+          <div class="score-big" id="scoreBig">—</div>
+          <div class="diag-score" id="diagScore"></div>
+          <div class="score-logic" id="scoreLogic"></div>
+        </div>
+      </div>
+
+      <div class="fw-block score-board" id="scoreBoardBlock">
+        <div class="fw-head">
+          <span class="fw-title">打分明细</span>
+          <span class="fw-hint" id="scoreBoardHint">有数才进分 · 缺的不记 0 · 点行跳图</span>
+        </div>
+        <div class="score-sum-bar" id="scoreSumBar"></div>
+        <div class="score-formula" id="scoreFormula"></div>
+        <div class="score-table-wrap">
+          <table class="score-table" id="scoreTable">
+            <thead>
+              <tr>
+                <th>状态</th>
+                <th>指标</th>
+                <th>单项分</th>
+                <th>打分原因</th>
+              </tr>
+            </thead>
+            <tbody id="scoreTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="fw-block">
+        <div class="fw-head">
+          <span class="fw-title">其他几路资金（速览）</span>
+          <span class="fw-hint">郭嘉队ETF仓位优先 · 融资分位×方向 · 主力</span>
+        </div>
+        <div class="triple-row" id="tripleRow"></div>
+        <div class="resonance" id="resonanceLine"></div>
+      </div>
+
+      <div class="fw-block">
+        <div class="fw-head">
+          <span class="fw-title">三种系统性风险</span>
+          <span class="fw-hint">杀杠杆 · 股东退出 · 国家队退出/过热调控</span>
+        </div>
+        <div class="node-grid" id="nodeGrid"></div>
+      </div>
+
+      <div class="fw-block">
+        <div class="fw-head">
+          <span class="fw-title">资金行为路径（你在哪一段）</span>
+          <span class="fw-hint">对照资金行为图 · 黑买红卖 · 散户常是最后一棒</span>
+        </div>
+        <div class="diag-position" id="diagPosition"></div>
+        <div class="phase-rail" id="phaseRail"></div>
+      </div>
+
+      <div class="diag-items hidden" id="diagItems"></div>
+      <div class="item-rules" id="itemRules"></div>
+      <div class="period-hint" id="periodHint"></div>
+      <div class="period-wrap" id="periodWrap"></div>
+      <div class="diag-gaps" id="diagGaps"></div>
+    </section>
+
+    <section class="pane pane-k" id="pane-weekly" data-series="weekly">
+      <div class="pane-label" id="weeklyLabel">指数周线</div>
+      <div class="overlay-toggles" id="overlayToggles">
+        <label class="ov-tog"><input type="checkbox" id="togMargin" checked /> 融资</label>
+        <label class="ov-tog"><input type="checkbox" id="togEtf" checked /> 郭嘉队ETF</label>
+      </div>
+      <div class="chart" id="chart-weekly"></div>
+      <div class="pane-empty hidden">暂无周线</div>
+    </section>
+    <section class="pane pane-score" id="pane-score" data-series="score">
+      <div class="pane-label">位置打分（−10～10）· 有数项合计，缺的不记 0</div>
+      <div class="chart" id="chart-score"></div>
+      <div class="pane-empty hidden">暂无打分曲线</div>
+    </section>
+    <section class="pane" id="pane-mf-m" data-series="mf_month">
+      <div class="pane-label">01 主力 · 月净额（亿）· 线 −4000</div>
+      <div class="chart" id="chart-mf-m"></div>
+      <div class="pane-empty hidden">暂无月净额（东财窗口偏短）</div>
+    </section>
+    <section class="pane" id="pane-mf-w" data-series="mf_week">
+      <div class="pane-label">01 主力 · 周净额（亿）· 线 −2000</div>
+      <div class="chart" id="chart-mf-w"></div>
+      <div class="pane-empty hidden">暂无周净额</div>
+    </section>
+    <section class="pane" id="pane-nb" data-series="northbound_week">
+      <div class="pane-label">北向 · 周净买（亿）</div>
+      <div class="chart" id="chart-nb"></div>
+      <div class="pane-empty hidden">暂无北向（2024-08 后字段常空）</div>
+    </section>
+    <section class="pane" id="pane-etf" data-series="etf">
+      <div class="pane-label">02 郭嘉队ETF 份额（亿份）· 旁证≠汇金</div>
+      <div class="chart" id="chart-etf"></div>
+      <div class="pane-empty hidden">暂无郭嘉队ETF份额</div>
+    </section>
+    <section class="pane" id="pane-margin" data-series="margin">
+      <div class="pane-label">03 融资余额（亿）</div>
+      <div class="chart" id="chart-margin"></div>
+      <div class="pane-empty hidden">暂无两融</div>
+    </section>
+    <section class="pane" id="pane-gv" data-series="growth_value">
+      <div class="pane-label">04 成长/价值偏离</div>
+      <div class="chart" id="chart-gv"></div>
+      <div class="pane-empty hidden">暂无偏离度</div>
+    </section>
+    <section class="pane" id="pane-hl" data-series="high_low">
+      <div class="pane-label">05 新高−新低（右）· 差值（左）</div>
+      <div class="chart" id="chart-hl"></div>
+      <div class="pane-empty hidden">暂无广度</div>
+    </section>
+    <section class="pane" id="pane-unlock-m" data-series="unlock_month">
+      <div class="pane-label">06 解禁 · 月（亿）· 含未来半年 · 柱全市场 线科创</div>
+      <div class="chart" id="chart-unlock-m"></div>
+      <div class="pane-empty hidden">暂无月度解禁</div>
+    </section>
+    <section class="pane" id="pane-unlock-q" data-series="unlock_quarter">
+      <div class="pane-label">06 解禁 · 季（亿）· 含未来半年 · 柱全市场 线科创</div>
+      <div class="chart" id="chart-unlock-q"></div>
+      <div class="pane-empty hidden">暂无季度解禁</div>
+    </section>
+    <div id="empty" class="empty hidden">点击「从库加载」或「更新入库」加载周线与五项指标</div>
+    <div id="loading" class="loading hidden" aria-busy="true">
+      <div class="loading-card">
+        <div class="loading-spin"></div>
+        <div class="loading-text" id="loadingText">正在加载图表…</div>
+      </div>
+    </div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
