@@ -66,12 +66,26 @@
     return document.getElementById(id);
   }
 
+  let _loadingTimer = null;
   function setLoading(on, text) {
     const node = el("loading");
     const label = el("loadingText");
     if (label && text) label.textContent = text;
     if (node) node.classList.toggle("hidden", !on);
     document.body.classList.toggle("is-loading", !!on);
+    // 安全超时：30 秒后自动隐藏，防止 loading 永远不消失
+    if (_loadingTimer) { clearTimeout(_loadingTimer); _loadingTimer = null; }
+    if (on) {
+      _loadingTimer = setTimeout(function () {
+        if (node) node.classList.add("hidden");
+        document.body.classList.remove("is-loading");
+        _loadingTimer = null;
+        var qs = el("qualitySummary");
+        if (qs && /绘制|加载/.test(qs.textContent || "")) {
+          qs.textContent = (qs.textContent || "") + " · 绘制超时已解除遮罩，可再点「从库加载」";
+        }
+      }, 20000);
+    }
   }
 
   function fmtSpan(sp) {
@@ -399,6 +413,69 @@
         grid.appendChild(card);
       });
     }
+
+    const red = d.red_light || {};
+    const redGrid = el("redLightGrid");
+    if (redGrid) {
+      redGrid.innerHTML = "";
+      (red.flags || []).forEach((f) => {
+        const card = document.createElement("div");
+        card.className = "red-card " + (f.on ? "on" : "off");
+        card.innerHTML =
+          "<div class=\"rt\">" + (f.label || "") + "</div>" +
+          "<div class=\"rs\">" + (f.on ? "亮" : "灭") + "</div>" +
+          "<div class=\"rn\">" + (f.note || "") + "</div>";
+        redGrid.appendChild(card);
+      });
+    }
+    const redNote = el("redLightNote");
+    if (redNote) {
+      redNote.textContent = red.note || "";
+      redNote.className = "red-note" + (red.severe ? " severe" : "");
+    }
+    const redHint = el("redLightHint");
+    if (redHint && red.lit != null) {
+      redHint.textContent = "亮 " + red.lit + "/4 · 偏离 · 高低比 · 高杠杆 · 外盘";
+    }
+
+    const kType = el("kTypeBlock");
+    if (kType) {
+      const k = d.k_type || {};
+      kType.innerHTML = k.mode
+        ? "<strong>" + k.mode + "</strong> — " + (k.hint || "")
+        : "";
+    }
+
+    const layersHost = el("layersHost");
+    if (layersHost) {
+      layersHost.innerHTML = "";
+      (d.layers || []).forEach((layer) => {
+        const block = document.createElement("div");
+        block.className = "layer-block";
+        const chips = document.createElement("div");
+        chips.className = "layer-chips";
+        (layer.items || []).forEach((it) => {
+          const chip = document.createElement("span");
+          const isGap = it.status === "gap" || it.score == null;
+          const scCls = isGap ? "gap" : it.score < 0 ? "neg" : it.score > 0 ? "pos" : "flat";
+          chip.className = "q-badge " + scCls;
+          chip.title = (it.note || "") + (it.rule ? "\n规则：" + it.rule : "");
+          chip.textContent =
+            (it.label || it.id) +
+            (isGap ? " ·缺" : " " + (it.score > 0 ? "+" + it.score : String(it.score)));
+          chips.appendChild(chip);
+        });
+        block.innerHTML =
+          "<div class=\"lb-title\">" +
+          (layer.title || "") +
+          " <span>" +
+          (layer.hint || "") +
+          "</span></div>";
+        block.appendChild(chips);
+        layersHost.appendChild(block);
+      });
+    }
+
     if (items) items.innerHTML = "";
 
     const rules = el("itemRules");
@@ -1034,7 +1111,19 @@
   function render(payload) {
     const empty = el("empty");
     const data = payload || {};
+    state.payload = data;
     setLoading(true, "正在绘制图表…");
+    try {
+      _renderInner(data, empty);
+    } catch (err) {
+      console.error("renderDpCycle failed", err);
+      const qs = el("qualitySummary");
+      if (qs) qs.textContent = "绘制失败: " + (err && err.message ? err.message : String(err));
+      setLoading(false);
+    }
+  }
+
+  function _renderInner(data, empty) {
     const weekly = mapCandles(data.weekly || []);
     const mfMonthRows = data.main_force_monthly || [];
     const mfWeekRows = data.main_force_weekly || data.main_force || [];
@@ -1057,8 +1146,8 @@
       unlockMonthRows.length ||
       unlockQuarterRows.length;
 
-    renderQuality(data);
-    renderDiagnosis(data);
+    try { renderQuality(data); } catch (e) { console.warn("renderQuality", e); }
+    try { renderDiagnosis(data); } catch (e) { console.warn("renderDiagnosis", e); }
 
     if (!hasAny) {
       if (empty) empty.classList.remove("hidden");

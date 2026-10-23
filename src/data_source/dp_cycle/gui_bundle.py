@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import date
 from typing import Any
 
@@ -162,6 +163,38 @@ def load_dp_cycle_gui_bundle(
         df = tables.get(tbl, pd.DataFrame())
         meta[key] = {"ok": not df.empty, "rows": int(len(df))}
 
+    # 美股拥挤度：读库只吃本地快照（无缓存就跳过，绝不在打开软件时扫 FRED/akshare）；
+    # 「更新入库」才强制联网重算并写缓存。
+    us_crowding: dict[str, Any] | None = None
+    try:
+        from data_source.dp_cycle.us_crowding import (
+            load_cached_crowding_snapshot,
+            load_or_compute_crowding_snapshot,
+        )
+
+        if refresh:
+            us_crowding = load_or_compute_crowding_snapshot(force_refresh=True)
+        else:
+            us_crowding = load_cached_crowding_snapshot(max_age_hours=24 * 14)
+        if us_crowding:
+            meta["us_crowding"] = {
+                "ok": True,
+                "score": us_crowding.get("crowding_score"),
+                "verdict": us_crowding.get("verdict"),
+                "from_cache": not bool(refresh),
+            }
+        else:
+            meta["us_crowding"] = {
+                "ok": False,
+                "error": "无本地快照，请点「更新入库」生成" if not refresh else "计算失败",
+            }
+    except Exception as exc:
+        meta["us_crowding"] = {"ok": False, "error": str(exc)}
+
+    # 流动性节点监控数据（按需获取，不阻塞主流程）
+    # 在 _switch_view("liquidity") 时单独获取
+    liquidity: dict[str, Any] | None = None
+
     return {
         "weekly": tables.get("weekly", pd.DataFrame()),
         "main_force_daily": mf,
@@ -175,6 +208,11 @@ def load_dp_cycle_gui_bundle(
         "growth_value": tables.get("growth_value", pd.DataFrame()),
         "high_low": tables.get("high_low", pd.DataFrame()),
         "unlock_daily": tables.get("unlock_daily", pd.DataFrame()),
+        "fund_issue": tables.get("fund_issue", pd.DataFrame()),
+        "holder_reduce": tables.get("holder_reduce", pd.DataFrame()),
+        "industry_flow_daily": tables.get("industry_flow_daily", pd.DataFrame()),
+        "us_crowding": us_crowding,
+        "liquidity": liquidity,
         "meta": meta,
     }
 
@@ -256,40 +294,160 @@ def _high_low_captions(hl: pd.DataFrame | None) -> tuple[str, str, str]:
     )
 
 
-def bundle_to_web_payload(bundle: dict[str, Any], *, index_label: str = "") -> dict[str, Any]:
+def _db_mtime_ns() -> int:
+    from data_source.dp_cycle.store import db_path
+
+    path = db_path()
+    try:
+        return int(os.stat(path).st_mtime_ns)
+    except OSError:
+        return 0
+
+
+def _payload_cache_path(index_symbol: str) -> "Path":
+    from pathlib import Path
+
+    from output_paths import dp_cycle_store_dir
+
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(index_symbol))
+    return Path(dp_cycle_store_dir()) / f"gui_payload_{safe}.json"
+
+
+def load_cached_web_payload(
+    index_symbol: str, *, require_heavy: bool = False
+) -> dict[str, Any] | None:
+    """读 GUI 网页载荷缓存；库文件 mtime 变化则失效。"""
+    import json
+
+    path = _payload_cache_path(index_symbol)
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return None
+        envelope = raw.get("_cache") or {}
+        if int(envelope.get("db_mtime_ns") or -1) != _db_mtime_ns():
+            return None
+        if str(envelope.get("index_symbol") or "") != str(index_symbol):
+            return None
+        if require_heavy and not bool(envelope.get("heavy", True)):
+            return None
+        payload = raw.get("payload")
+        meta = raw.get("meta") or {}
+        if not isinstance(payload, dict):
+            return None
+        meta = dict(meta)
+        meta["from_payload_cache"] = True
+        return {"payload": payload, "meta": meta}
+    except Exception:
+        return None
+
+
+def save_web_payload_cache(
+    index_symbol: str, payload: dict[str, Any], meta: dict[str, Any] | None = None
+) -> None:
+    import json
+    from datetime import datetime
+
+    path = _payload_cache_path(index_symbol)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        envelope = {
+            "_cache": {
+                "index_symbol": index_symbol,
+                "db_mtime_ns": _db_mtime_ns(),
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+                "heavy": bool((payload.get("diagnosis") or {}).get("heavy", True)),
+            },
+            "payload": payload,
+            "meta": meta or {},
+        }
+        path.write_text(json.dumps(envelope, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def invalidate_web_payload_cache(index_symbol: str | None = None) -> None:
+    from pathlib import Path
+
+    from output_paths import dp_cycle_store_dir
+
+    root = Path(dp_cycle_store_dir())
+    if index_symbol:
+        p = _payload_cache_path(index_symbol)
+        if p.is_file():
+            p.unlink(missing_ok=True)
+        return
+    for p in root.glob("gui_payload_*.json"):
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def load_gui_web_result(
+    *,
+    index_symbol: str = DEFAULT_WEEKLY_INDEX,
+    high_low_start: str = HISTORY_START_STR,
+    refresh: bool = False,
+    skip_high_low: bool = False,
+    mode: str = "auto",
+    heavy: bool | None = None,
+) -> dict[str, Any]:
+    """GUI 一站式：优先磁盘缓存 → 读库组装。refresh 时强制重算并写缓存。"""
+    if heavy is None:
+        heavy = bool(refresh)
+    if not refresh:
+        cached = load_cached_web_payload(index_symbol, require_heavy=bool(heavy))
+        if cached is not None:
+            return cached
+
+    label = next((k for k, v in INDEX_CHOICES.items() if v == index_symbol), index_symbol)
+    bundle = load_dp_cycle_gui_bundle(
+        index_symbol=index_symbol,
+        high_low_start=high_low_start,
+        refresh=refresh,
+        skip_high_low=skip_high_low,
+        mode=mode,
+    )
+    payload = bundle_to_web_payload(bundle, index_label=label, heavy=heavy)
+    meta = bundle.get("meta") or {}
+    # 入库后库 mtime 已变；读库结果写缓存，下次打开秒开
+    save_web_payload_cache(str(meta.get("index_symbol") or index_symbol), payload, meta)
+    return {"payload": payload, "meta": meta}
+
+
+def bundle_to_web_payload(
+    bundle: dict[str, Any], *, index_label: str = "", heavy: bool = True
+) -> dict[str, Any]:
     """网页载荷：五项一律周频，与顶图周线同一时间网格，避免日频/稀疏点对不齐。"""
     weekly = bundle.get("weekly")
     anchor = _weekly_anchor_dates(weekly)
+    # ── 性能优化：向量化替代 iterrows ──
     w_rows: list[dict[str, Any]] = []
     if weekly is not None and not weekly.empty:
-        for _, r in weekly.iterrows():
-            t = _date_str(r.get("date"))
-            if not t:
-                continue
-            w_rows.append(
-                {
-                    "time": t,
-                    "open": float(r["open"]),
-                    "high": float(r["high"]),
-                    "low": float(r["low"]),
-                    "close": float(r["close"]),
-                }
-            )
+        _dates = pd.to_datetime(weekly["date"], errors="coerce")
+        _mask = _dates.notna()
+        _d = _dates[_mask].dt.strftime("%Y-%m-%d")
+        _o = weekly.loc[_mask, "open"].to_numpy(dtype=float)
+        _h = weekly.loc[_mask, "high"].to_numpy(dtype=float)
+        _l = weekly.loc[_mask, "low"].to_numpy(dtype=float)
+        _c = weekly.loc[_mask, "close"].to_numpy(dtype=float)
+        w_rows = [
+            {"time": _d.iloc[i], "open": _o[i], "high": _h[i], "low": _l[i], "close": _c[i]}
+            for i in range(len(_d))
+        ]
 
     def _series_df(df: pd.DataFrame | None, value_col: str) -> list[dict[str, Any]]:
         if df is None or df.empty or value_col not in df.columns:
             return []
-        out: list[dict[str, Any]] = []
-        for _, r in df.iterrows():
-            t = _date_str(r.get("date"))
-            try:
-                fv = float(r.get(value_col))
-            except Exception:
-                continue
-            if not t or pd.isna(fv):
-                continue
-            out.append({"time": t, "value": fv})
-        return out
+        _d = pd.to_datetime(df["date"], errors="coerce")
+        _v = pd.to_numeric(df[value_col], errors="coerce")
+        _mask = _d.notna() & _v.notna()
+        _ds = _d[_mask].dt.strftime("%Y-%m-%d")
+        _vs = _v[_mask].to_numpy(dtype=float)
+        return [{"time": _ds.iloc[i], "value": _vs[i]} for i in range(len(_ds))]
 
     # 01 主力：对照 PDF —— 月净额主档 + 周净额副档（东财大盘主力净流入）
     mf_daily = bundle.get("main_force_daily")
@@ -328,17 +486,22 @@ def bundle_to_web_payload(bundle: dict[str, Any], *, index_label: str = "") -> d
             merged = pd.concat(parts, axis=1).dropna(how="all").reset_index()
             if "date" not in merged.columns:
                 merged = merged.rename(columns={merged.columns[0]: "date"})
-            for _, r in merged.iterrows():
-                t = _date_str(r.get("date"))
-                if not t:
-                    continue
-                row: dict[str, Any] = {"time": t}
-                for src, dst in (("new_high", "new_high"), ("new_low", "new_low"), ("新高-新低", "diff")):
-                    if src in merged.columns and pd.notna(r.get(src)):
-                        try:
-                            row[dst] = float(r[src])
-                        except Exception:
-                            pass
+            # ── 向量化替代 iterrows ──
+            _d = pd.to_datetime(merged["date"], errors="coerce")
+            _mask = _d.notna()
+            _ds = _d[_mask].dt.strftime("%Y-%m-%d")
+            _nh = merged.loc[_mask, "new_high"].to_numpy(dtype=float) if "new_high" in merged.columns else None
+            _nl = merged.loc[_mask, "new_low"].to_numpy(dtype=float) if "new_low" in merged.columns else None
+            _df = merged.loc[_mask, "新高-新低"].to_numpy(dtype=float) if "新高-新低" in merged.columns else None
+            _n = len(_ds)
+            for i in range(_n):
+                row: dict[str, Any] = {"time": _ds.iloc[i]}
+                if _nh is not None and not pd.isna(_nh[i]):
+                    row["new_high"] = _nh[i]
+                if _nl is not None and not pd.isna(_nl[i]):
+                    row["new_low"] = _nl[i]
+                if _df is not None and not pd.isna(_df[i]):
+                    row["diff"] = _df[i]
                 hl_rows.append(row)
 
     meta = bundle.get("meta") or {}
@@ -364,15 +527,20 @@ def bundle_to_web_payload(bundle: dict[str, Any], *, index_label: str = "") -> d
     def _unlock_rows(frame: pd.DataFrame) -> list[dict[str, Any]]:
         if frame is None or frame.empty:
             return []
+        # ── 向量化替代 iterrows ──
+        _d = pd.to_datetime(frame["date"], errors="coerce")
+        _mask = _d.notna()
+        _ds = _d[_mask].dt.strftime("%Y-%m-%d")
+        _all = frame.loc[_mask, "全市场_亿元"].to_numpy(dtype=float) if "全市场_亿元" in frame.columns else None
+        _star = frame.loc[_mask, "科创板_亿元"].to_numpy(dtype=float) if "科创板_亿元" in frame.columns else None
+        _n = len(_ds)
         rows: list[dict[str, Any]] = []
-        for _, r in frame.iterrows():
-            t = _date_str(r.get("date"))
-            if not t:
-                continue
-            row: dict[str, Any] = {"time": t}
-            for src, dst in (("全市场_亿元", "all"), ("科创板_亿元", "star")):
-                if src in frame.columns and pd.notna(r.get(src)):
-                    row[dst] = float(r[src])
+        for i in range(_n):
+            row: dict[str, Any] = {"time": _ds.iloc[i]}
+            if _all is not None and not pd.isna(_all[i]):
+                row["all"] = _all[i]
+            if _star is not None and not pd.isna(_star[i]):
+                row["star"] = _star[i]
             if "all" in row or "star" in row:
                 rows.append(row)
         return rows
@@ -437,7 +605,7 @@ def bundle_to_web_payload(bundle: dict[str, Any], *, index_label: str = "") -> d
 
     from data_source.dp_cycle.diagnosis import diagnose_position
 
-    diagnosis = diagnose_position(bundle)
+    diagnosis = diagnose_position(bundle, heavy=heavy)
 
     return {
         "subtitle": subtitle,
@@ -464,6 +632,7 @@ def bundle_to_web_payload(bundle: dict[str, Any], *, index_label: str = "") -> d
         "coverage": _coverage(),
         "coverage_span": coverage_span,
         "coverage_note": coverage_note,
+        "liquidity": bundle.get("liquidity"),
     }
 
 

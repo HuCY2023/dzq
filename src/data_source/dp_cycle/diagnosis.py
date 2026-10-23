@@ -12,22 +12,28 @@ from typing import Any
 
 import pandas as pd
 
-# 口播里的数量级，用来对照，不是拟合出来的最优阈值。
-DIVERGENCE_EXTREME = 16.0
-HL_HOT_RATIO = 8.0
-HL_COLD_RATIO = 0.2
-UNLOCK_HOT_MULT = 1.5
-MAIN_FORCE_WEEK_EXTREME = -2000.0
-
-# 融资：看仓位历史分位 × 近月方向，不看单纯增减
-MARGIN_PCT_HIGH = 75.0
-MARGIN_PCT_LOW = 40.0
-MARGIN_DELTA_FLAT = 300.0  # 约 21 日变动小于此视为横盘（亿）
-
-# 郭嘉队ETF：仓位分位优先，权重最大
-NT_PCT_HIGH = 75.0
-NT_PCT_LOW = 40.0
-NT_DELTA_FLAT = 5.0  # 亿份
+from data_source.dp_cycle.rules import (  # noqa: E402
+    DIVERGENCE_EXTREME,
+    HL_COLD_RATIO,
+    HL_HOT_RATIO,
+    MAIN_FORCE_WEEK_EXTREME,
+    NT_PCT_HIGH,
+    NT_PCT_LOW,
+    NT_SHORT_WINDOW,
+    UNLOCK_HOT_MULT,
+    breadth_shape,
+    divergence_shape,
+    score_breadth,
+    score_divergence,
+    score_fund_issue,
+    score_holder_reduce,
+    score_industry_flow,
+    score_margin_regime,
+    score_national_team_regime,
+    score_scissors,
+    score_unlock_hot,
+    decide_retail_action_core,
+)
 
 # 每项怎么打分（报告和网页共用）
 SCORE_RULES: dict[str, str] = {
@@ -45,6 +51,13 @@ SCORE_RULES: dict[str, str] = {
     "divergence": "偏离 ≥16 → −1。从约 15 以上明显收窄 → −1（切向价值）。",
     "breadth": "近 5 日高低比 ≥8 → +1（偏热）；≤0.2 → −1（偏冷）。指数仍涨且极冷 → 背离 −1。",
     "unlock": "本月或下月解禁 ≥ 近 24 完整月中位数的 1.5 倍 → −1。解禁后两三个月主力流出容易偏高。",
+    "scissors": "周「主力−(中单+小单)」≤ −3000 亿 → −1。中单小单单独不作看多。",
+    "fund_issue": "公募新发：上周 ≥300 亿份且本周不到一半 → −1（片子 −9 周案例）。",
+    "holder_reduce": "大股东减持：本周 ≥50 亿且比上周增 75% → −1。",
+    "industry_flow": "行业资金：科技周净额 ≤ −80 且银行 ≥ −10 → −1。",
+    "ashare_crowding": "成交拥挤度：例 62.8% 成交集中在前 10% 个股（扩展位，有湖再进分）。",
+    "iv_spread": "科创隐含波动率分位远高于标普 VIX + 高杠杆 = 脆弱（扩展位）。",
+    "us_crowding": "美股保证金/M2≈6% 警戒；VIX/信用利差旁证。不进 A 股合计分，只作全球脆弱提示。",
 }
 
 # 三资金角色一句话
@@ -74,64 +87,7 @@ def _zone(pct: float | None, high: float, low: float) -> str:
     return "mid"
 
 
-def score_margin_regime(pct: float | None, delta: float) -> tuple[int, str, str, str]:
-    """返回 (score, zone, trend, tag)。trend: up/down/flat。"""
-    zone = _zone(pct, MARGIN_PCT_HIGH, MARGIN_PCT_LOW)
-    if abs(delta) < MARGIN_DELTA_FLAT:
-        trend = "flat"
-    elif delta > 0:
-        trend = "up"
-    else:
-        trend = "down"
-    if zone == "gap":
-        return 0, zone, trend, "无分位"
-    if zone == "high":
-        if trend == "up":
-            return -3, zone, trend, "高位还在加，风险在升，警惕离开"
-        if trend == "down":
-            return -2, zone, trend, "高位去杠杆，杀杠杆进行中"
-        return -1, zone, trend, "高位钝化，仓位仍贵"
-    if zone == "low":
-        if trend == "up":
-            return 2, zone, trend, "低位加杠杆，跟随"
-        if trend == "down":
-            return -1, zone, trend, "低位减杠杆，跟随偏空"
-        return 1, zone, trend, "低位企稳，可跟随"
-    if trend == "up":
-        return 1, zone, trend, "中位加杠杆，温和跟随"
-    if trend == "down":
-        return -1, zone, trend, "中位减杠杆"
-    return 0, zone, trend, "中位横盘"
-
-
-def score_national_team_regime(pct: float | None, delta: float) -> tuple[int, str, str, str]:
-    """郭嘉队ETF：仓位分位优先，分值幅度最大。trend: in/out/flat。"""
-    zone = _zone(pct, NT_PCT_HIGH, NT_PCT_LOW)
-    if abs(delta) < NT_DELTA_FLAT:
-        trend = "flat"
-    elif delta > 0:
-        trend = "in"
-    else:
-        trend = "out"
-    if zone == "gap":
-        return 0, zone, trend, "无份额分位"
-    if zone == "high":
-        if trend == "out":
-            return -4, zone, trend, "高仓位还在减——优先级最高，说明大问题"
-        if trend == "in":
-            return -2, zone, trend, "高仓位还在加，拥挤，警惕"
-        return -2, zone, trend, "高仓位钝化，风险偏大"
-    if zone == "low":
-        if trend == "in":
-            return 3, zone, trend, "低仓位加仓，托举，可跟随"
-        if trend == "out":
-            return -1, zone, trend, "低仓位仍减，力度有限"
-        return 1, zone, trend, "低仓位企稳"
-    if trend == "out":
-        return -2, zone, trend, "中仓位减仓"
-    if trend == "in":
-        return 1, zone, trend, "中仓位加仓"
-    return 0, zone, trend, "中仓位横盘"
+# score_margin_regime / score_national_team_regime 已移至 rules.py
 
 
 def _num(series: pd.Series) -> pd.Series:
@@ -314,7 +270,8 @@ def _main_force_item(mf: pd.DataFrame) -> dict[str, Any]:
 
 
 def _national_team_item(etf_monthly: pd.DataFrame | None) -> dict[str, Any]:
-    """宽基份额仓位分位 × 月变动；最高优先级进分。≠汇金/证金身份。"""
+    """宽基份额仓位分位 × 月变动；最高优先级进分。≠汇金/证金身份。
+    双轨分位：全样本 + 近 NT_SHORT_WINDOW 月，取更极端一侧判 zone。"""
     x = etf_monthly if isinstance(etf_monthly, pd.DataFrame) else pd.DataFrame()
     if x is None or x.empty or "份额_亿份" not in getattr(x, "columns", []):
         return _item(
@@ -349,13 +306,18 @@ def _national_team_item(etf_monthly: pd.DataFrame | None) -> dict[str, Any]:
         delta = shares - float(y["份额_亿份"].iloc[-2])
     else:
         delta = 0.0
-    # 截至当月的历史分位（含当期）
+    # 双轨分位：全样本 + 近 N 月
     hist = y["份额_亿份"]
-    pct_v = float((hist <= shares).mean() * 100.0)
+    pct_all = float((hist <= shares).mean() * 100.0)
+    short_hist = hist.tail(NT_SHORT_WINDOW)
+    pct_short = float((short_hist <= shares).mean() * 100.0) if len(short_hist) >= 12 else pct_all
+    # 取更极端一侧（高仓位取大值，低仓位取小值）
+    pct_v = max(pct_all, pct_short) if pct_all >= 50 else min(pct_all, pct_short)
     score, zone, trend, tag = score_national_team_regime(pct_v, delta)
     day_txt = f"{day} " if day else ""
+    dual_txt = f"全{pct_all:.0f}%/近{NT_SHORT_WINDOW}月{pct_short:.0f}%"
     note = (
-        f"{day_txt}份额 {shares:.0f} 亿份，历史分位 {pct_v:.0f}%（{zone}），"
+        f"{day_txt}份额 {shares:.0f} 亿份，分位 {dual_txt}→{pct_v:.0f}%（{zone}），"
         f"月变动 {delta:+.1f} 亿份（{trend}）。{tag}。≠汇金/证金净交易。"
     )
     out = _item("national_team", "郭嘉队ETF", score=score, note=note, status="ok")
@@ -363,6 +325,8 @@ def _national_team_item(etf_monthly: pd.DataFrame | None) -> dict[str, Any]:
     out["trend"] = trend
     out["direction"] = trend if trend in {"in", "out", "flat"} else "flat"
     out["pct"] = pct_v
+    out["pct_all"] = pct_all
+    out["pct_short"] = pct_short
     out["proxy_delta"] = delta
     return out
 
@@ -499,7 +463,12 @@ def _funds_month_table(bundle: dict[str, Any], *, months: int = 8) -> list[dict[
 
 
 def score_history_weekly(bundle: dict[str, Any]) -> list[dict[str, Any]]:
-    """按周复算可见项合计分，供主图下方打分曲线（轴 −10～10）。缺项不记 0。"""
+    """按周复算可见项合计分，供主图下方打分曲线（轴 −10～10）。缺项不记 0。
+
+    性能优化：预转换 numpy 数组 + searchsorted 索引查找，避免每次循环创建 Series。
+    """
+    import numpy as np
+
     weekly = _prep(bundle.get("weekly"), ["close"])
     margin = _prep(bundle.get("margin"), ["融资余额_亿元", "分位_全样本"])
     gv = _prep(bundle.get("growth_value"), ["偏离度"])
@@ -515,37 +484,89 @@ def score_history_weekly(bundle: dict[str, Any]) -> list[dict[str, Any]]:
     else:
         return []
 
-    m_lvl = (
-        margin.dropna(subset=["融资余额_亿元"]).set_index("date").sort_index()["融资余额_亿元"]
-        if not margin.empty
-        else pd.Series(dtype=float)
-    )
-    m_pct = (
-        margin.dropna(subset=["分位_全样本"]).set_index("date").sort_index()["分位_全样本"]
-        if not margin.empty and "分位_全样本" in margin.columns
-        else pd.Series(dtype=float)
-    )
-    div = (
-        gv.dropna(subset=["偏离度"]).set_index("date").sort_index()["偏离度"]
-        if not gv.empty
-        else pd.Series(dtype=float)
-    )
-    hi = (
-        hl.dropna(subset=["new_high", "new_low"]).set_index("date").sort_index()
-        if not hl.empty
-        else pd.DataFrame()
-    )
-    unlock_all = pd.Series(dtype=float)
+    # ── 预转换 numpy 数组 + 日期索引，避免循环内重复 .loc[:end] ──
+    def _to_np(series: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+        """返回 (dates_as_i8, values)。"""
+        if series.empty:
+            return np.array([], dtype="datetime64[ns]"), np.array([], dtype=float)
+        idx = pd.DatetimeIndex(series.index).asi8
+        return idx, series.to_numpy(dtype=float, na_value=np.nan)
+
+    # 融资
+    if not margin.empty:
+        _m = margin.dropna(subset=["融资余额_亿元"]).set_index("date").sort_index()
+        m_lvl_i8, m_lvl_v = _to_np(_m["融资余额_亿元"])
+    else:
+        m_lvl_i8, m_lvl_v = np.array([], dtype="int64"), np.array([], dtype=float)
+
+    if not margin.empty and "分位_全样本" in margin.columns:
+        _mp = margin.dropna(subset=["分位_全样本"]).set_index("date").sort_index()
+        m_pct_i8, m_pct_v = _to_np(_mp["分位_全样本"])
+    else:
+        m_pct_i8, m_pct_v = np.array([], dtype="int64"), np.array([], dtype=float)
+
+    # 偏离度
+    if not gv.empty:
+        _d = gv.dropna(subset=["偏离度"]).set_index("date").sort_index()
+        div_i8, div_v = _to_np(_d["偏离度"])
+    else:
+        div_i8, div_v = np.array([], dtype="int64"), np.array([], dtype=float)
+
+    # 广度
+    if not hl.empty:
+        _h = hl.dropna(subset=["new_high", "new_low"]).set_index("date").sort_index()
+        hi_i8 = pd.DatetimeIndex(_h.index).asi8
+        hi_high = _h["new_high"].to_numpy(dtype=float)
+        hi_low = _h["new_low"].to_numpy(dtype=float)
+    else:
+        hi_i8 = np.array([], dtype="int64")
+        hi_high = hi_low = np.array([], dtype=float)
+
+    # 解禁（月度）
+    unlock_i8 = np.array([], dtype="int64")
+    unlock_v = np.array([], dtype=float)
     if not unlock.empty and "universe" in unlock.columns:
         ua = unlock.loc[unlock["universe"].astype(str) == "all"].dropna(subset=["amount_yi"])
         if not ua.empty:
-            unlock_all = ua.set_index("date").sort_index()["amount_yi"].resample("ME").sum(min_count=1).dropna()
-    mf_w = pd.Series(dtype=float)
-    if not mf.empty and len(mf) >= 20:
-        mf_w = mf.set_index("date").sort_index()["净额_亿元"].resample("W-FRI").sum(min_count=1).dropna()
+            _u = ua.set_index("date").sort_index()["amount_yi"].resample("ME").sum(min_count=1).dropna()
+            unlock_i8, unlock_v = _to_np(_u)
 
-    etf_shares = pd.Series(dtype=float)
-    etf_delta = pd.Series(dtype=float)
+    # 主力周合计
+    mf_w_v = np.array([], dtype=float)
+    mf_w_i8 = np.array([], dtype="int64")
+    gap_w_v = np.array([], dtype=float)
+    gap_w_i8 = np.array([], dtype="int64")
+    if not mf.empty and len(mf) >= 20:
+        _mw = mf.set_index("date").sort_index()["净额_亿元"].resample("W-FRI").sum(min_count=1).dropna()
+        mf_w_i8, mf_w_v = _to_np(_mw)
+        if {"中单_亿元", "小单_亿元"} <= set(mf.columns):
+            g = mf.dropna(subset=["净额_亿元", "中单_亿元", "小单_亿元"]).copy()
+            if len(g) >= 20:
+                g["_gap"] = g["净额_亿元"] - (g["中单_亿元"] + g["小单_亿元"])
+                _gw = g.set_index("date").sort_index()["_gap"].resample("W-FRI").sum(min_count=1).dropna()
+                gap_w_i8, gap_w_v = _to_np(_gw)
+
+    # 公募新发 / 减持 / 行业资金
+    def _ws_np(df: pd.DataFrame | None, value: str) -> tuple[np.ndarray, np.ndarray]:
+        s = _weekly_sum(df, value)
+        if s.empty:
+            return np.array([], dtype="int64"), np.array([], dtype=float)
+        return _to_np(s)
+
+    issue_w_i8, issue_w_v = _ws_np(bundle.get("fund_issue"), "shares_yi")
+    reduce_w_i8, reduce_w_v = _ws_np(bundle.get("holder_reduce"), "amount_yi")
+    ind = _prep(bundle.get("industry_flow_daily"), ["net_yi"])
+    tech_w_i8, tech_w_v = _ws_np(
+        ind.loc[ind["name"].isin(_TECH_BOARDS)] if not ind.empty and "name" in ind.columns else None, "net_yi"
+    )
+    bank_w_i8, bank_w_v = _ws_np(
+        ind.loc[ind["name"] == "银行"] if not ind.empty and "name" in ind.columns else None, "net_yi"
+    )
+
+    # ETF 份额
+    etf_i8 = np.array([], dtype="int64")
+    etf_shares_v = np.array([], dtype=float)
+    etf_delta_v = np.array([], dtype=float)
     if isinstance(etf_m, pd.DataFrame) and not etf_m.empty and "份额_亿份" in etf_m.columns:
         e = etf_m.copy()
         e["date"] = pd.to_datetime(e["date"], errors="coerce")
@@ -553,111 +574,347 @@ def score_history_weekly(bundle: dict[str, Any]) -> list[dict[str, Any]]:
         e["份额_亿份"] = pd.to_numeric(e["份额_亿份"], errors="coerce")
         e = e.dropna(subset=["份额_亿份"])
         if not e.empty:
-            etf_shares = pd.Series(e["份额_亿份"].values, index=pd.DatetimeIndex(e["date"]).normalize())
+            etf_i8 = pd.DatetimeIndex(e["date"]).normalize().asi8
+            etf_shares_v = e["份额_亿份"].to_numpy(dtype=float)
             if "月变动_亿份" in e.columns:
-                etf_delta = pd.Series(
-                    pd.to_numeric(e["月变动_亿份"], errors="coerce").values,
-                    index=etf_shares.index,
-                )
+                etf_delta_v = pd.to_numeric(e["月变动_亿份"], errors="coerce").to_numpy(dtype=float)
 
+    # ── 主循环：numpy 切片 + searchsorted ──
     out: list[dict[str, Any]] = []
-    for day in anchors:
-        end = pd.Timestamp(day).normalize()
+    # 预转 anchor 时间戳 i8
+    anchor_dt = pd.DatetimeIndex(anchors).normalize()
+    anchor_i8 = anchor_dt.asi8
+
+    for i, day in enumerate(anchors):
+        end_i8 = anchor_i8[i]
+        end_ts = anchor_dt[i]
         total = 0
         scored = 0
 
-        # 郭嘉队ETF：最高优先，先加
-        if len(etf_shares.loc[:end]) >= 6:
-            hist = etf_shares.loc[:end]
-            shares = float(hist.iloc[-1])
-            pct_nt = float((hist <= shares).mean() * 100.0)
-            if len(etf_delta.loc[:end]) and pd.notna(etf_delta.loc[:end].iloc[-1]):
-                d_nt = float(etf_delta.loc[:end].iloc[-1])
-            elif len(hist) >= 2:
-                d_nt = shares - float(hist.iloc[-2])
-            else:
-                d_nt = 0.0
-            sc_nt, _, _, _ = score_national_team_regime(pct_nt, d_nt)
-            total += sc_nt
-            scored += 1
+        # 郭嘉队ETF：最高优先，先加（双轨分位）
+        if len(etf_i8) >= 6:
+            ei = int(np.searchsorted(etf_i8, end_i8, side="right"))
+            if ei >= 6:
+                hist = etf_shares_v[:ei]
+                shares = float(hist[-1])
+                pct_all = float((hist <= shares).mean() * 100.0)
+                short_n = min(NT_SHORT_WINDOW, len(hist))
+                short_hist = hist[-short_n:]
+                pct_short = float((short_hist <= shares).mean() * 100.0) if short_n >= 12 else pct_all
+                pct_nt = max(pct_all, pct_short) if pct_all >= 50 else min(pct_all, pct_short)
+                if len(etf_delta_v) and ei > 0 and not np.isnan(etf_delta_v[ei - 1]):
+                    d_nt = float(etf_delta_v[ei - 1])
+                elif ei >= 2:
+                    d_nt = shares - float(hist[-2])
+                else:
+                    d_nt = 0.0
+                sc_nt, _, _, _ = score_national_team_regime(pct_nt, d_nt)
+                total += sc_nt
+                scored += 1
 
-        if len(m_lvl.loc[:end]) >= 22:
-            tail = m_lvl.loc[:end]
-            delta = float(tail.iloc[-1] - tail.iloc[-22])
-            pct_raw = float(m_pct.loc[:end].iloc[-1]) if len(m_pct.loc[:end]) else None
+        # 融资
+        mi = int(np.searchsorted(m_lvl_i8, end_i8, side="right"))
+        if mi >= 22:
+            delta = float(m_lvl_v[mi - 1] - m_lvl_v[mi - 22])
+            mpi = int(np.searchsorted(m_pct_i8, end_i8, side="right"))
+            pct_raw = float(m_pct_v[mpi - 1]) if mpi > 0 else None
             pct_v = _as_pct(pct_raw)
             sc_m, _, _, _ = score_margin_regime(pct_v, delta)
             total += sc_m
             scored += 1
 
-        if len(div.loc[:end]):
-            last = float(div.loc[:end].iloc[-1])
-            earlier = div.loc[: end - pd.Timedelta(days=60)]
-            prev = float(earlier.iloc[-1]) if len(earlier) else None
-            if last >= DIVERGENCE_EXTREME:
-                total -= 1
-            elif prev is not None and prev >= DIVERGENCE_EXTREME - 1 and last < prev - 0.4:
-                total -= 1
+        # 偏离度
+        di = int(np.searchsorted(div_i8, end_i8, side="right"))
+        if di > 0:
+            last = float(div_v[di - 1])
+            cutoff_i8 = end_i8 - np.timedelta64(60, "D")
+            ei60 = int(np.searchsorted(div_i8, cutoff_i8, side="right"))
+            prev = float(div_v[ei60 - 1]) if ei60 > 0 else None
+            total += score_divergence(divergence_shape(last, prev))
             scored += 1
 
-        if not hi.empty:
-            htail = hi.loc[:end].tail(5)
-            if len(htail):
-                ratio = float(htail["new_high"].mean()) / max(float(htail["new_low"].mean()), 1.0)
-                if ratio >= HL_HOT_RATIO:
-                    total += 1
-                elif ratio <= HL_COLD_RATIO:
-                    total -= 1
+        # 广度
+        if len(hi_i8):
+            hi_idx = int(np.searchsorted(hi_i8, end_i8, side="right"))
+            if hi_idx > 0:
+                start_b = max(0, hi_idx - 5)
+                h_mean = float(hi_high[start_b:hi_idx].mean())
+                l_mean = float(hi_low[start_b:hi_idx].mean())
+                ratio = h_mean / max(l_mean, 1.0)
+                total += score_breadth(breadth_shape(ratio, False))
                 scored += 1
 
-        if len(unlock_all):
-            this_end = end.to_period("M").to_timestamp("M")
-            history = unlock_all.loc[unlock_all.index < end.replace(day=1)]
-            base = float(history.tail(24).median()) if len(history) else None
-            this_val = float(unlock_all.loc[this_end]) if this_end in unlock_all.index else None
+        # 解禁
+        if len(unlock_i8):
+            this_end = end_ts.to_period("M").to_timestamp("M")
+            month1_i8 = np.datetime64(end_ts.replace(day=1).normalize(), "ns").view("int64")
+            hist_idx = int(np.searchsorted(unlock_i8, month1_i8, side="left"))
+            base = float(np.median(unlock_v[max(0, hist_idx - 24):hist_idx])) if hist_idx > 0 else None
+            this_i8 = np.datetime64(this_end, "ns").view("int64")
+            this_pos = int(np.searchsorted(unlock_i8, this_i8, side="left"))
+            this_val = float(unlock_v[this_pos]) if this_pos < len(unlock_i8) and unlock_i8[this_pos] == this_i8 else None
             nxt = (this_end + pd.offsets.MonthEnd(1)).normalize()
-            next_val = float(unlock_all.loc[nxt]) if nxt in unlock_all.index else None
-            hot = bool(
-                base
-                and (
-                    (this_val is not None and this_val >= base * UNLOCK_HOT_MULT)
-                    or (next_val is not None and next_val >= base * UNLOCK_HOT_MULT)
-                )
-            )
-            if hot:
+            nxt_i8 = np.datetime64(nxt, "ns").view("int64")
+            nxt_pos = int(np.searchsorted(unlock_i8, nxt_i8, side="left"))
+            next_val = float(unlock_v[nxt_pos]) if nxt_pos < len(unlock_i8) and unlock_i8[nxt_pos] == nxt_i8 else None
+            if score_unlock_hot(this_val, next_val, base):
                 total -= 1
             scored += 1
 
-        if len(mf_w.loc[:end]):
-            last_mf = float(mf_w.loc[:end].iloc[-1])
+        # 主力周合计
+        mfi = int(np.searchsorted(mf_w_i8, end_i8, side="right"))
+        if mfi > 0:
+            last_mf = float(mf_w_v[mfi - 1])
             if last_mf <= MAIN_FORCE_WEEK_EXTREME:
                 total -= 2
             elif last_mf <= -1000:
                 total -= 1
             scored += 1
 
+        # 剪刀差
+        gi = int(np.searchsorted(gap_w_i8, end_i8, side="right"))
+        if gi > 0:
+            total += score_scissors(float(gap_w_v[gi - 1]))
+            scored += 1
+
+        # 公募新发
+        ii = int(np.searchsorted(issue_w_i8, end_i8, side="right"))
+        if ii >= 2:
+            total += score_fund_issue(float(issue_w_v[ii - 1]), float(issue_w_v[ii - 2]))
+            scored += 1
+
+        # 减持
+        ri = int(np.searchsorted(reduce_w_i8, end_i8, side="right"))
+        if ri >= 2:
+            total += score_holder_reduce(float(reduce_w_v[ri - 1]), float(reduce_w_v[ri - 2]))
+            scored += 1
+
+        # 行业资金
+        ti = int(np.searchsorted(tech_w_i8, end_i8, side="right"))
+        bi = int(np.searchsorted(bank_w_i8, end_i8, side="right"))
+        if ti > 0 and bi > 0:
+            total += score_industry_flow(float(tech_w_v[ti - 1]), float(bank_w_v[bi - 1]))
+            scored += 1
+
         if scored == 0:
             continue
         total = max(-10, min(10, int(total)))
-        out.append({"time": end.strftime("%Y-%m-%d"), "value": total})
+        out.append({"time": end_ts.strftime("%Y-%m-%d"), "value": total})
     return out
 
 
-def diagnose_position(bundle: dict[str, Any]) -> dict[str, Any]:
-    """根据已入库序列给一个位置判断。结构对齐框架.md：三资金 → 行为 → 提前量 → 仓位带。"""
+_TECH_BOARDS = {
+    "半导体",
+    "消费电子",
+    "计算机设备",
+    "软件开发",
+    "通信设备",
+    "光学光电子",
+    "元件",
+    "互联网服务",
+}
+
+
+def _weekly_sum(df: pd.DataFrame | None, value: str) -> pd.Series:
+    x = _prep(df, [value])
+    if x.empty or value not in x.columns:
+        return pd.Series(dtype=float)
+    s = pd.to_numeric(x[value], errors="coerce")
+    out = x.assign(_v=s).dropna(subset=["_v"]).set_index("date").sort_index()["_v"]
+    if out.empty:
+        return out
+    return out.resample("W-FRI").sum(min_count=1).dropna()
+
+
+def _scissors_item(mf: pd.DataFrame | None) -> dict[str, Any]:
+    x = _prep(mf, ["净额_亿元", "中单_亿元", "小单_亿元"])
+    if x.empty or not {"净额_亿元", "中单_亿元", "小单_亿元"} <= set(x.columns):
+        return _item("scissors", "剪刀差", score=None, note="主力行里还没有中单小单", status="gap")
+    x = x.dropna(subset=["净额_亿元", "中单_亿元", "小单_亿元"])
+    if len(x) < 20:
+        return _item("scissors", "剪刀差", score=None, note=f"只有 {len(x)} 日", status="gap")
+    gap = x["净额_亿元"] - (x["中单_亿元"] + x["小单_亿元"])
+    weekly = gap.groupby(x["date"].dt.to_period("W-FRI")).sum()
+    last = float(weekly.iloc[-1])
+    day = str(weekly.index[-1].end_time.date())
+    if last <= -3000:
+        score, tag = -1, "周剪刀差到 3000 亿一档，计负分"
+    else:
+        score, tag = 0, "未到作者那档约 4000 亿"
+    return _item("scissors", "剪刀差", score=score, note=f"{day} 当周 主力−(中单+小单) {last:.0f} 亿。{tag}", status="ok")
+
+
+def _fund_issue_item(raw: pd.DataFrame | None) -> dict[str, Any]:
+    weekly = _weekly_sum(raw, "shares_yi")
+    if len(weekly) < 8:
+        return _item("fund_issue", "公募新发", score=None, note="新成立份额不足 8 周", status="gap")
+    last = float(weekly.iloc[-1])
+    prev = float(weekly.iloc[-2])
+    day = pd.Timestamp(weekly.index[-1]).date()
+    if prev >= 300 and last <= prev * 0.5:
+        score, tag = -1, "本周成立份额不到上周一半，且上周已在 300 亿以上"
+    else:
+        score, tag = 0, "未见腰斩式回落"
+    return _item(
+        "fund_issue",
+        "公募新发",
+        score=score,
+        note=f"{day} 当周成立 {last:.0f} 亿份，上周 {prev:.0f}。{tag}。口径是已成立，不是认购中。",
+        status="ok",
+    )
+
+
+def _holder_reduce_item(raw: pd.DataFrame | None) -> dict[str, Any]:
+    weekly = _weekly_sum(raw, "amount_yi")
+    if len(weekly) < 8:
+        return _item("holder_reduce", "减持", score=None, note="减持金额不足 8 周", status="gap")
+    last = float(weekly.iloc[-1])
+    prev = float(weekly.iloc[-2])
+    day = pd.Timestamp(weekly.index[-1]).date()
+    if prev > 0 and last >= 50 and last >= prev * 1.75:
+        score, tag = -1, "周金额比上周增 75% 以上"
+    else:
+        score, tag = 0, "周环比未到 75%"
+    return _item(
+        "holder_reduce",
+        "减持",
+        score=score,
+        note=f"{day} 当周 {last:.0f} 亿，上周 {prev:.0f}。{tag}。按公告变动截止日，不是成交日。",
+        status="ok",
+    )
+
+
+def _industry_flow_item(raw: pd.DataFrame | None) -> dict[str, Any]:
+    x = _prep(raw, ["net_yi"])
+    if x.empty or "name" not in x.columns:
+        return _item("industry_flow", "行业资金", score=None, note="无行业资金流", status="gap")
+    x = x.dropna(subset=["net_yi"])
+    if x["date"].nunique() < 20:
+        return _item("industry_flow", "行业资金", score=None, note="行业日频不足", status="gap")
+    tech = x.loc[x["name"].isin(_TECH_BOARDS)]
+    bank = x.loc[x["name"] == "银行"]
+    if tech.empty or bank.empty:
+        return _item("industry_flow", "行业资金", score=None, note="缺科技或银行板块", status="gap")
+    tw = _weekly_sum(tech, "net_yi")
+    bw = _weekly_sum(bank, "net_yi")
+    if tw.empty or bw.empty:
+        return _item("industry_flow", "行业资金", score=None, note="无法聚周", status="gap")
+    last_t, last_b = float(tw.iloc[-1]), float(bw.iloc[-1])
+    day = pd.Timestamp(tw.index[-1]).date()
+    if last_t <= -80 and last_b >= -10:
+        score, tag = -1, "科技一周净流出，银行没有接"
+    else:
+        score, tag = 0, "未见科技大出而银行不接"
+    return _item(
+        "industry_flow",
+        "行业资金",
+        score=score,
+        note=f"{day} 科技合计 {last_t:.0f} 亿，银行 {last_b:.0f} 亿。{tag}。免费窗口约 120 日。",
+        status="ok",
+    )
+
+
+def _ashare_crowding_item() -> dict[str, Any]:
+    """A 股成交拥挤度：视频扩展位；有湖集中度算法前先占位。"""
+    return _item(
+        "ashare_crowding",
+        "成交拥挤度",
+        score=None,
+        note="片子例：约 62.8% 成交在前 10% 个股。湖内集中度未上线，不进分。",
+        status="gap",
+    )
+
+
+def _iv_spread_item() -> dict[str, Any]:
+    return _item(
+        "iv_spread",
+        "隐含波动率",
+        score=None,
+        note="片子：科创50 IV 分位 ≫ 标普 VIX 分位 + 高杠杆 = 脆。暂无期权序列。",
+        status="gap",
+    )
+
+
+def _us_crowding_item(us_crowding: dict[str, Any] | None) -> dict[str, Any]:
+    """美股拥挤度扩展位（框架 §3.D 全球杠杆 + 隐含波动率 + 信用 + 估值）。"""
+    if not us_crowding:
+        return _item("us_crowding", "美股拥挤度", score=None, note="未获取", status="gap")
+    margin_m2 = us_crowding.get("margin_m2_pct")
+    vix_pct = us_crowding.get("vix_pct")
+    sox_60d = us_crowding.get("sox_60d_ret")
+    cape = us_crowding.get("shiller_cape")
+    hy_ig = us_crowding.get("hy_ig_spread")
+    hy_ig_pct = us_crowding.get("hy_ig_pct")
+    vix_vxv = us_crowding.get("vix_vxv_ratio")
+    margin_gdp = us_crowding.get("margin_gdp_pct")
+    score = int(us_crowding.get("crowding_score", 0))
+    verdict = us_crowding.get("verdict", "")
+    parts: list[str] = []
+    if margin_m2 is not None:
+        tag = "危险" if margin_m2 >= 6.0 else ("偏高" if margin_m2 >= 5.0 else "正常")
+        parts.append(f"保证金/M2={margin_m2:.1f}%({tag})")
+    if margin_gdp is not None:
+        parts.append(f"保证金/GDP={margin_gdp:.1f}%")
+    if cape is not None:
+        tag = "极端" if cape >= 35 else "高位"
+        parts.append(f"CAPE={cape:.1f}({tag})")
+    if vix_pct is not None:
+        tag = "预警" if vix_pct >= 60 else "正常"
+        parts.append(f"VIX分位={vix_pct:.0f}%({tag})")
+    if vix_vxv is not None:
+        struct = us_crowding.get("vix_structure", "")
+        parts.append(f"VIX/VXV={vix_vxv:.2f}({struct})")
+    if sox_60d is not None:
+        parts.append(f"SOX 60d={sox_60d:+.1f}%")
+    if hy_ig is not None and hy_ig_pct is not None:
+        tag = "压力" if hy_ig_pct >= 80 else "正常"
+        parts.append(f"HY-IG={hy_ig:.2f}%({hy_ig_pct:.0f}%分位,{tag})")
+    note = "，".join(parts) + f"。评分{score}/6 {verdict}"
+    # 只作参考，不计入 A 股打分
+    return _item("us_crowding", "美股拥挤度", score=None, note=note, status="info")
+
+
+def diagnose_position(bundle: dict[str, Any], *, heavy: bool = True) -> dict[str, Any]:
+    """根据已入库序列给一个位置判断。结构对齐框架.md：三资金 → 行为 → 提前量 → 仓位带。
+
+    heavy=False：跳过历史阶段表 / 评分曲线（各约数百 ms～1s+），供 GUI 读库快路径；
+    完整表在「更新入库」或 payload 缓存未命中后的后台补全时再算。
+    """
     margin_item = _margin_item(bundle.get("margin"))
     div_item, div_shape = _divergence_item(bundle.get("growth_value"))
     br_item, br_shape = _breadth_item(bundle.get("high_low"), bundle.get("weekly"))
     unlock_item, unlock_hot = _unlock_item(bundle.get("unlock_daily"))
     mf_item = _main_force_item(bundle.get("main_force_daily"))
     nt_item = _national_team_item(bundle.get("etf_monthly"))
-    # 展示顺序：郭嘉队ETF最高优先 → 杠杆 → 主力 → 行为 → 解禁
-    items = [nt_item, margin_item, mf_item, div_item, br_item, unlock_item]
+    sc_item = _scissors_item(bundle.get("main_force_daily"))
+    fi_item = _fund_issue_item(bundle.get("fund_issue"))
+    hr_item = _holder_reduce_item(bundle.get("holder_reduce"))
+    ind_item = _industry_flow_item(bundle.get("industry_flow_daily"))
+    crowd_item = _ashare_crowding_item()
+    iv_item = _iv_spread_item()
+    us_item = _us_crowding_item(bundle.get("us_crowding"))
+    # 展示顺序对齐视频：三资金 → 行为 → 解禁 → −9 扩展 → 全球旁证
+    items = [
+        nt_item,
+        margin_item,
+        mf_item,
+        div_item,
+        br_item,
+        unlock_item,
+        sc_item,
+        fi_item,
+        hr_item,
+        ind_item,
+        crowd_item,
+        iv_item,
+        us_item,
+    ]
     gaps = [
-        "主力长历史（东财窗口短）",
-        "汇金+证金月变动（现用郭嘉队ETF份额仓位分位代理）",
-        "公募新发 / 大股东减持 / 行业资金切换",
-        "成交拥挤度、隐含波动、全球杠杆等扩展位",
+        "主力长历史仍只有东财近端；周≥2000/−9 复刻依赖滚库",
+        "国家队：宽基份额代理 ≠ 汇金/证金月变 ≠ ETF 净流入",
+        "成交拥挤度（前10%成交占比）未进湖",
+        "科创隐含波动率 vs VIX 分位未接",
+        "产业二阶导（HBM 等涨价斜率）不进行情库",
     ]
 
     scored = [it for it in items if it["status"] == "ok" and it["score"] is not None]
@@ -747,6 +1004,11 @@ def diagnose_position(bundle: dict[str, Any]) -> dict[str, Any]:
     position["equity_text"] = decision["equity_text"]
     position["decision"] = decision["id"]
     position["decision_label"] = decision["label"]
+    position["score"] = score
+    position["nt_zone"] = nt_zone
+    position["nt_trend"] = nt_trend
+    position["margin_zone"] = m_zone
+    position["margin_trend"] = m_trend
     phases = []
     for row in PHASES:
         if row["id"] == "unclear":
@@ -765,7 +1027,9 @@ def diagnose_position(bundle: dict[str, Any]) -> dict[str, Any]:
                 "active": row["id"] == phase_id,
             }
         )
-    periods = [row for row in monthly_regimes(bundle) if row.get("phase_id") != "unclear"]
+    periods: list[dict[str, Any]] = []
+    if heavy:
+        periods = [row for row in monthly_regimes(bundle) if row.get("phase_id") != "unclear"]
 
     def _node(nid: str, title: str, status: str, text: str) -> dict[str, Any]:
         return {"id": nid, "title": title, "status": status, "text": text}
@@ -813,30 +1077,113 @@ def diagnose_position(bundle: dict[str, Any]) -> dict[str, Any]:
     fund_items = [nt_item, margin_item, mf_item]
     triple = [_triple_card(it) for it in fund_items]
     resonance = _resonance(fund_items)
+    extend_items = [sc_item, fi_item, hr_item, ind_item]
+    global_items = [crowd_item, iv_item, us_item]
     layers = [
         {
             "id": "funds",
             "title": "A. 资金三件套",
-            "hint": "郭嘉队ETF仓位优先（±3/±4）· 融资分位×方向 · 主力风控",
+            "hint": "郭嘉队ETF仓位优先 · 融资分位×方向 · 主力只作风控",
             "items": fund_items,
         },
         {
             "id": "behavior",
             "title": "B. 行为两件套",
-            "hint": "极值只说明分裂；下跌仍看资金侧边际",
+            "hint": "极值=分裂/买盘吃力；触发下跌仍看资金侧边际",
             "items": [div_item, br_item],
         },
         {
             "id": "ahead",
             "title": "C. 提前量",
-            "hint": "解禁后两三个月主力流出容易偏高",
+            "hint": "解禁可提前约一年；高峰后 2–3 月主力易偏高",
             "items": [unlock_item],
         },
+        {
+            "id": "minus9",
+            "title": "D. −9 周扩展项",
+            "hint": "日常 ±1/±2；多项同负才打出极端分（片子 26·6 月第4周）",
+            "items": extend_items,
+        },
+        {
+            "id": "global",
+            "title": "E. 拥挤 / 波动 / 外盘",
+            "hint": "红灯旁证；有数展示，默认不进 A 股合计分",
+            "items": global_items,
+        },
     ]
+
+    # 视频「红灯四件套」：偏离极值 + 广度背离 + 高杠杆 + 外盘脆弱
+    us_fragile = False
+    us_raw = bundle.get("us_crowding") if isinstance(bundle.get("us_crowding"), dict) else None
+    if us_item.get("status") in {"info", "ok"} and us_raw:
+        try:
+            us_fragile = int(us_raw.get("crowding_score") or 0) >= 4
+        except (TypeError, ValueError):
+            us_fragile = False
+        if not us_fragile and us_raw.get("margin_m2_pct") is not None:
+            try:
+                us_fragile = float(us_raw["margin_m2_pct"]) >= 5.5
+            except (TypeError, ValueError):
+                pass
+    red_flags = [
+        {
+            "id": "div",
+            "label": "偏离极值",
+            "on": div_shape == "extreme",
+            "note": "≈17 或分位顶端",
+        },
+        {
+            "id": "breadth",
+            "label": "高低比背离",
+            "on": br_shape in {"cold", "diverge"},
+            "note": "热~10:1 / 空~1:10；涨中极冷=背离",
+        },
+        {
+            "id": "leverage",
+            "label": "高杠杆",
+            "on": m_zone == "high",
+            "note": "融资分位高位（场外杠杆看不见）",
+        },
+        {
+            "id": "global",
+            "label": "外盘脆弱",
+            "on": us_fragile,
+            "note": "保证金/M2≈6% 或拥挤评分偏高",
+        },
+    ]
+    red_on = sum(1 for f in red_flags if f["on"])
+    red_light = {
+        "flags": red_flags,
+        "lit": red_on,
+        "severe": red_on >= 3 and funds_worse,
+        "note": (
+            f"红灯 {red_on}/4 亮"
+            + (" · 且资金侧在变差 → 严肃对待" if red_on >= 3 and funds_worse else "")
+            + (" · 扳机仍是资金边际，不是偏离本身" if red_on else "")
+        ),
+    }
+
+    if div_shape == "narrowing":
+        k_type = {
+            "mode": "切价值",
+            "hint": "偏离从高位收窄：大资金成长→价值，顺风切换，不宜教条死守。",
+        }
+    elif div_shape == "extreme":
+        k_type = {
+            "mode": "K型走阔",
+            "hint": "成长虹吸价值、偏离走阔：高拥挤资产对二阶导敏感，财报前易躲。",
+        }
+    else:
+        k_type = {
+            "mode": "中性",
+            "hint": "偏离未到极值；K型切换信号弱。",
+        }
+
     score_logic = (
-        "你是散户：盯其他几路资金重大改变。"
-        "权重 郭嘉队ETF仓位 > 融资分位×方向 > 主力/行为/解禁。"
-        "打分落到五档：离场 / 减仓 / 持有观望 / 加仓 / 抄底。缺的不记 0。"
+        "散户决策：盯其他几路资金重大改变。"
+        "权重 郭嘉队ETF > 融资分位×方向 > 主力/行为/解禁/−9扩展。"
+        "日常约 ±1/±2；多项同负才极端（如 −9）。"
+        "硬信号优先 → 离场/减仓/持有/加仓/抄底。缺的不记 0。"
     )
 
     return {
@@ -845,7 +1192,7 @@ def diagnose_position(bundle: dict[str, Any]) -> dict[str, Any]:
         "score": score,
         "score_note": f"已打分 {len(scored)} 项，合计 {score:+d}。缺的不记 0。",
         "score_logic": score_logic,
-        "framework": "散户决策 · 盯其他几路资金 · 打分出仓位",
+        "framework": "散户决策 · 视频全量口径 · 打分出仓位",
         "decision": decision,
         "decision_scale": [
             {
@@ -858,6 +1205,8 @@ def diagnose_position(bundle: dict[str, Any]) -> dict[str, Any]:
         ],
         "items": items,
         "layers": layers,
+        "red_light": red_light,
+        "k_type": k_type,
         "triple": triple,
         "resonance": resonance,
         "funds_month": _funds_month_table(bundle),
@@ -866,5 +1215,6 @@ def diagnose_position(bundle: dict[str, Any]) -> dict[str, Any]:
         "position": position,
         "phases": phases,
         "periods": periods,
-        "score_curve": score_history_weekly(bundle),
+        "score_curve": score_history_weekly(bundle) if heavy else [],
+        "heavy": bool(heavy),
     }

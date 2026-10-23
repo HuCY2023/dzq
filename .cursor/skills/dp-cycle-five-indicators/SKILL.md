@@ -81,7 +81,9 @@ DP Cycle Progress:
 - 高位持续增加 → 风险升，警惕离开  
 - 低位持续增减 → 跟随（不是高位那套反着做）
 
-实现：`diagnosis.score_margin_regime` / `score_national_team_regime` → `diagnose_position` → `decide_retail_action`。
+实现：`rules.score_margin_regime` / `score_national_team_regime`（纯规则，零 IO）→ `diagnosis.diagnose_position` → `allocation.decide_retail_action`。
+
+郭嘉队ETF **双轨分位**：全样本 + 近 36 月，取更极端一侧判 zone（避免高库存被全样本稀释）。
 
 ## 2. 换机最小步骤
 
@@ -96,7 +98,9 @@ PYTHONPATH=.;.\src .venv\Scripts\python scripts\research\_audit_dp_path.py
 
 | 任务 | 落点 |
 |------|------|
-| 打分 / 决策 | `diagnosis.py`、`allocation.py` |
+| 打分 / 决策 | `rules.py`（纯规则）、`diagnosis.py`、`allocation.py` |
+| 事件回测 | `scripts/research/backtest_dp_signals.py` |
+| 每日入库 | `scripts/daily/run_dp_cycle_daily.py`（挂 daily-ritual 16:00） |
 | 取数入库 | `src/data_source/dp_cycle/*`、`ingest.py`、`store.py` |
 | 交叉验证 | `cross_check.py`、`margin.py` |
 | GUI / 网页 | `dp_cycle_page.py`、`web/dp_cycle/` |
@@ -107,9 +111,9 @@ PYTHONPATH=.;.\src .venv\Scripts\python scripts\research\_audit_dp_path.py
 
 | # | 现状 | 缺口 |
 |---|------|------|
-| 01 | 主力东财≈1 日 | PDF 级月净额 / 长历史 |
-| 02 | ETF 份额代理 | ≠ 汇金/证金；分位仅 ~5 年可能稀释「高库存」 |
-| 03 | 融资分位×方向已落地 | 75/40、300 亿阈未事件回测 |
+| 01 | 主力东财≈1 日 | **已挂每日自动入库**，滚一天长一天；PDF 级长历史仍缺 |
+| 02 | ETF 份额代理 | ≠ 汇金/证金；**已加双轨分位（全+近36月）缓解稀释**；数据仅~5年 |
+| 03 | 融资分位×方向已落地 | 75/40、300 亿阈 **已建事件回测脚本**，待数据积累后标定 |
 | 04 | 偏离稀 | 乐咕源限制 |
 | 05 | 广度湖扫未剔 ST | ≠ 作者样本 |
 | 06 | 解禁已含未来半年 | 明细对账另表 |

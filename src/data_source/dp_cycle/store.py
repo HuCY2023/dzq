@@ -6,15 +6,29 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from datetime import date, datetime
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-import duckdb
 import pandas as pd
+
+if TYPE_CHECKING:
+    from duckdb import DuckDBPyConnection
+
+
+def _duckdb():
+    """GUI 首屏会 import store 常量；勿顶层拉 duckdb（冷启动可达数秒）。"""
+    import duckdb
+
+    return duckdb
+
 
 HISTORY_START = date(2015, 1, 1)
 HISTORY_START_STR = "2015-01-01"
+
+# init_schema 幂等但重复跑 DDL 有开销；用标记跳过同连接内的重复调用
+_schema_inited: set[int] = set()  # id(con) -> 已初始化
 
 # 建议刷新粒度（说明用）：按源数据颗粒度，日/周/月均可，不强制统一月或季。
 # 实际以库内最新日期 + 源能取到的频率为准；慢变序列周更也完全合理。
@@ -27,6 +41,9 @@ SERIES_GRAIN = {
     "growth_value_daily": "day",
     "high_low_daily": "day",  # 乐咕120日快径；湖内52周可覆盖
     "unlock_daily": "day",  # 解禁日统计；网页按月/季加总
+    "fund_issue": "day",  # 新成立公募，按成立日；周合计在诊断层
+    "holder_reduce": "day",  # 重要股东减持公告，按变动截止日
+    "industry_flow_daily": "day",  # 东财行业主力，窗口约 120 日，日更累积
 }
 
 
@@ -38,7 +55,8 @@ def db_path() -> str:
     return os.path.join(root, "dp_cycle.duckdb")
 
 
-def connect(*, read_only: bool = False) -> duckdb.DuckDBPyConnection:
+def connect(*, read_only: bool = False) -> DuckDBPyConnection:
+    duckdb = _duckdb()
     path = db_path()
     if read_only and not os.path.isfile(path):
         # 空库时只读会失败，改写模式建库
@@ -48,7 +66,11 @@ def connect(*, read_only: bool = False) -> duckdb.DuckDBPyConnection:
     return duckdb.connect(path, read_only=read_only and os.path.isfile(path))
 
 
-def init_schema(con: duckdb.DuckDBPyConnection) -> None:
+def init_schema(con: DuckDBPyConnection) -> None:
+    cid = id(con)
+    if cid in _schema_inited:
+        return
+    _schema_inited.add(cid)
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS meta_runs (
@@ -131,8 +153,44 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             source VARCHAR,
             PRIMARY KEY (date, universe)
         );
+        CREATE TABLE IF NOT EXISTS fund_issue (
+            code VARCHAR PRIMARY KEY,
+            name VARCHAR,
+            found_date DATE,
+            shares_yi DOUBLE,
+            fund_type VARCHAR
+        );
+        CREATE TABLE IF NOT EXISTS holder_reduce (
+            code VARCHAR,
+            holder VARCHAR,
+            end_date DATE,
+            notice_date DATE,
+            change_wan DOUBLE,
+            close_price DOUBLE,
+            amount_yi DOUBLE,
+            PRIMARY KEY (code, holder, end_date, notice_date)
+        );
+        CREATE TABLE IF NOT EXISTS industry_flow_daily (
+            date DATE,
+            bk_code VARCHAR,
+            name VARCHAR,
+            net_yi DOUBLE,
+            mid_yi DOUBLE,
+            small_yi DOUBLE,
+            PRIMARY KEY (date, bk_code)
+        );
         """
     )
+    for stmt in (
+        "ALTER TABLE main_force_daily ADD COLUMN IF NOT EXISTS small_yi DOUBLE",
+        "ALTER TABLE main_force_daily ADD COLUMN IF NOT EXISTS mid_yi DOUBLE",
+        "ALTER TABLE main_force_daily ADD COLUMN IF NOT EXISTS large_yi DOUBLE",
+        "ALTER TABLE main_force_daily ADD COLUMN IF NOT EXISTS super_yi DOUBLE",
+    ):
+        try:
+            con.execute(stmt)
+        except Exception:
+            pass
     # 兼容旧库缺列；乐咕 120 日与湖 252 日必须分键共存，禁止按 date 互相覆盖
     try:
         con.execute("ALTER TABLE high_low_daily ADD COLUMN IF NOT EXISTS source VARCHAR")
@@ -150,7 +208,7 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
             )
 
 
-def _migrate_high_low_source_key(con: duckdb.DuckDBPyConnection) -> None:
+def _migrate_high_low_source_key(con: DuckDBPyConnection) -> None:
     """旧表主键只有 date 时，乐咕尾部会接到湖扫序列上。改成 (date, source)。"""
     info = con.execute("PRAGMA table_info('high_low_daily')").fetchall()
     pk_names = [r[1] for r in info if len(r) > 5 and r[5]]
@@ -192,7 +250,7 @@ def _migrate_high_low_source_key(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("ALTER TABLE high_low_daily__pk RENAME TO high_low_daily")
 
 
-def preferred_high_low_source(con: duckdb.DuckDBPyConnection, start: str) -> str | None:
+def preferred_high_low_source(con: DuckDBPyConnection, start: str) -> str | None:
     """展示只用一种口径。湖扫够长时用 252 日，否则退回乐咕 120 日，禁止拼接。"""
     rows = con.execute(
         """
@@ -227,7 +285,7 @@ def clip_from_2015(df: pd.DataFrame, date_col: str = "date") -> pd.DataFrame:
 
 
 def upsert_dataframe(
-    con: duckdb.DuckDBPyConnection,
+    con: DuckDBPyConnection,
     table: str,
     df: pd.DataFrame,
     *,
@@ -235,11 +293,20 @@ def upsert_dataframe(
 ) -> int:
     if df is None or df.empty:
         return 0
+    # init_schema 已在首次调用时跑过，跳过重复 DDL
     init_schema(con)
-    clean = df.drop_duplicates(subset=key_cols, keep="last").copy()
+    clean = df.drop_duplicates(subset=key_cols, keep="last")
+    # 避免不必要的 .copy()；只在需要转换日期列时才拷贝
+    needs_copy = False
     for c in key_cols:
         if c in clean.columns and str(clean[c].dtype).startswith("datetime"):
-            clean[c] = pd.to_datetime(clean[c]).dt.date
+            needs_copy = True
+            break
+    if needs_copy:
+        clean = clean.copy()
+        for c in key_cols:
+            if c in clean.columns and str(clean[c].dtype).startswith("datetime"):
+                clean[c] = pd.to_datetime(clean[c]).dt.date
     tmp = f"_tmp_{table}"
     con.register(tmp, clean)
     cols = list(clean.columns)
@@ -251,7 +318,7 @@ def upsert_dataframe(
 
 
 def touch_series(
-    con: duckdb.DuckDBPyConnection,
+    con: DuckDBPyConnection,
     series: str,
     *,
     last_date: date | datetime | pd.Timestamp | None,
@@ -269,7 +336,7 @@ def touch_series(
     )
 
 
-def log_run(con: duckdb.DuckDBPyConnection, *, mode: str, ok: bool, detail: str) -> None:
+def log_run(con: DuckDBPyConnection, *, mode: str, ok: bool, detail: str) -> None:
     init_schema(con)
     con.execute(
         "INSERT INTO meta_runs VALUES (?, ?, ?, ?)",
@@ -329,6 +396,9 @@ def table_counts() -> dict[str, int]:
             "growth_value_daily",
             "high_low_daily",
             "unlock_daily",
+            "fund_issue",
+            "holder_reduce",
+            "industry_flow_daily",
         ):
             try:
                 out[t] = int(con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0])
@@ -355,11 +425,30 @@ def list_weekly_symbols() -> list[str]:
         con.close()
 
 
+# load_from_db 缓存：同一次进程内，如果库文件未变且参数相同，直接返回上次结果
+_load_cache: dict[str, Any] = {"key": None, "val": None}
+
+
+def _invalidate_load_cache() -> None:
+    """入库后调用此函数使缓存失效。"""
+    _load_cache["key"] = None
+    _load_cache["val"] = None
+
+
 def load_from_db(
     *,
     index_symbol: str = "sh000001",
     start: str = HISTORY_START_STR,
 ) -> dict[str, pd.DataFrame]:
+    # 缓存检查：库文件 mtime + 参数作为 key
+    path = db_path()
+    if os.path.isfile(path):
+        mtime = os.path.getmtime(path)
+        cache_key = f"{path}:{mtime}:{index_symbol}:{start}"
+        if _load_cache["key"] == cache_key and _load_cache["val"] is not None:
+            return _load_cache["val"]
+    else:
+        cache_key = None
     empty = {
         "weekly": pd.DataFrame(),
         "main_force_daily": pd.DataFrame(),
@@ -370,6 +459,9 @@ def load_from_db(
         "growth_value": pd.DataFrame(),
         "high_low": pd.DataFrame(),
         "unlock_daily": pd.DataFrame(),
+        "fund_issue": pd.DataFrame(),
+        "holder_reduce": pd.DataFrame(),
+        "industry_flow_daily": pd.DataFrame(),
     }
     if not os.path.isfile(db_path()):
         return empty
@@ -387,14 +479,26 @@ def load_from_db(
             [index_symbol, start_ts],
         ).df()
 
-        mf = con.execute(
-            """
-            SELECT date, net_yi AS 净额_亿元, inflow_yi AS 流入_亿元,
-                   outflow_yi AS 流出_亿元, industry_n AS 行业数
-            FROM main_force_daily WHERE date >= ? ORDER BY date
-            """,
-            [start_ts],
-        ).df()
+        try:
+            mf = con.execute(
+                """
+                SELECT date, net_yi AS 净额_亿元, inflow_yi AS 流入_亿元,
+                       outflow_yi AS 流出_亿元, industry_n AS 行业数,
+                       small_yi AS 小单_亿元, mid_yi AS 中单_亿元,
+                       large_yi AS 大单_亿元, super_yi AS 超大单_亿元
+                FROM main_force_daily WHERE date >= ? ORDER BY date
+                """,
+                [start_ts],
+            ).df()
+        except Exception:
+            mf = con.execute(
+                """
+                SELECT date, net_yi AS 净额_亿元, inflow_yi AS 流入_亿元,
+                       outflow_yi AS 流出_亿元, industry_n AS 行业数
+                FROM main_force_daily WHERE date >= ? ORDER BY date
+                """,
+                [start_ts],
+            ).df()
 
         try:
             nb = con.execute(
@@ -468,7 +572,32 @@ def load_from_db(
         except Exception:
             unlock = pd.DataFrame()
 
-        return {
+        def _safe(sql: str) -> pd.DataFrame:
+            try:
+                return con.execute(sql, [start_ts]).df()
+            except Exception:
+                return pd.DataFrame()
+
+        fund_issue = _safe(
+            """
+            SELECT code, name, found_date AS date, shares_yi, fund_type
+            FROM fund_issue WHERE found_date >= ? ORDER BY found_date
+            """
+        )
+        holder_reduce = _safe(
+            """
+            SELECT code, holder, end_date AS date, notice_date, change_wan, close_price, amount_yi
+            FROM holder_reduce WHERE end_date >= ? ORDER BY end_date
+            """
+        )
+        industry_flow = _safe(
+            """
+            SELECT date, bk_code, name, net_yi, mid_yi, small_yi
+            FROM industry_flow_daily WHERE date >= ? ORDER BY date, bk_code
+            """
+        )
+
+        result = {
             "weekly": weekly,
             "main_force_daily": mf,
             "northbound_daily": nb,
@@ -478,6 +607,14 @@ def load_from_db(
             "growth_value": gv,
             "high_low": hl,
             "unlock_daily": unlock,
+            "fund_issue": fund_issue,
+            "holder_reduce": holder_reduce,
+            "industry_flow_daily": industry_flow,
         }
+        # 存入缓存
+        if cache_key is not None:
+            _load_cache["key"] = cache_key
+            _load_cache["val"] = result
+        return result
     finally:
         con.close()

@@ -76,7 +76,13 @@ def upsert_today_from_ths(*, as_of: date | None = None) -> tuple[pd.DataFrame, d
             "行业数": int(len(snap)),
         }
         hist = hist[hist["date"] != pd.Timestamp(as_of)]
-        hist = pd.concat([hist, pd.DataFrame([row])], ignore_index=True)
+        # ── 性能优化：numpy append 替代 pd.concat 单行追加 ──
+        import numpy as np
+        new_row = pd.DataFrame([row])
+        if hist.empty:
+            hist = new_row
+        else:
+            hist = pd.concat([hist, new_row], ignore_index=True)
         hist = hist.sort_values("date")
         hist.to_csv(path, index=False, encoding="utf-8-sig")
         meta["ok"] = True

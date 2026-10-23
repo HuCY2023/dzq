@@ -350,18 +350,19 @@ def enrich_margin(df: pd.DataFrame, *, lookback_years: int = 5) -> pd.DataFrame:
     x = x.sort_values("date").reset_index(drop=True)
     x["分位_全样本"] = x["融资余额_亿元"].rank(pct=True) * 100.0
 
-    pct_n: list[float | None] = []
-    for _, row in x.iterrows():
-        d = row["date"]
-        v = row["融资余额_亿元"]
-        window = x.loc[
-            (x["date"] >= d - pd.DateOffset(years=lookback_years)) & (x["date"] <= d),
-            "融资余额_亿元",
-        ]
-        if len(window) < 5 or pd.isna(v):
-            pct_n.append(None)
-        else:
-            pct_n.append(float((window <= v).sum() / len(window) * 100.0))
+    # ── 性能优化：numpy searchsorted 替代 iterrows + .loc[] 切片 ──
+    import numpy as np
+    _vals = x["融资余额_亿元"].to_numpy(dtype=float)
+    _dt64 = x["date"].to_numpy(dtype="datetime64[ns]")
+    _offset_ns = np.timedelta64(lookback_years * 365, "D")  # 近似 N 年
+    _left_idx = np.searchsorted(_dt64, _dt64 - _offset_ns, side="left")
+    _n = len(_vals)
+    pct_n = np.full(_n, np.nan)
+    for i in range(_n):
+        li = int(_left_idx[i])
+        win = _vals[li : i + 1]
+        if len(win) >= 5 and not np.isnan(_vals[i]):
+            pct_n[i] = float((win <= _vals[i]).sum() / len(win) * 100.0)
     x["分位_近N年"] = pct_n
     x["lookback_years"] = lookback_years
 

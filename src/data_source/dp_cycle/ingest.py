@@ -23,6 +23,7 @@ from data_source.dp_cycle.store import (
     log_run,
     touch_series,
     upsert_dataframe,
+    _invalidate_load_cache,
 )
 
 
@@ -110,20 +111,25 @@ def ingest_main_force(con, *, as_of: date | None = None) -> dict[str, Any]:
     except Exception:
         pass
 
+    def _num(col: str):
+        if col not in daily.columns:
+            return pd.Series([pd.NA] * len(daily))
+        return pd.to_numeric(daily[col], errors="coerce")
+
     out = pd.DataFrame(
         {
             "date": pd.to_datetime(daily["date"]).dt.date,
-            "net_yi": pd.to_numeric(daily.get("净额_亿元"), errors="coerce"),
-            "inflow_yi": pd.to_numeric(daily.get("流入_亿元"), errors="coerce")
-            if "流入_亿元" in daily.columns
-            else pd.NA,
-            "outflow_yi": pd.to_numeric(daily.get("流出_亿元"), errors="coerce")
-            if "流出_亿元" in daily.columns
-            else pd.NA,
+            "net_yi": _num("净额_亿元"),
+            "inflow_yi": _num("流入_亿元"),
+            "outflow_yi": _num("流出_亿元"),
             "industry_n": pd.to_numeric(daily.get("行业数"), errors="coerce").astype("Int64")
             if "行业数" in daily.columns
             else pd.NA,
             "source": source,
+            "small_yi": _num("小单_亿元"),
+            "mid_yi": _num("中单_亿元"),
+            "large_yi": _num("大单_亿元"),
+            "super_yi": _num("超大单_亿元"),
         }
     )
     n = upsert_dataframe(con, "main_force_daily", out, key_cols=["date"])
@@ -311,6 +317,71 @@ def ingest_unlock(con) -> dict[str, Any]:
     return {**meta, "wrote": n}
 
 
+def ingest_fund_issue(con) -> dict[str, Any]:
+    from data_source.dp_cycle.fund_issue import fetch_fund_issues
+
+    raw, meta = fetch_fund_issues()
+    raw = clip_from_2015(raw, date_col="found_date") if not raw.empty else raw
+    if raw is None or raw.empty:
+        return {**meta, "wrote": 0}
+    out = pd.DataFrame(
+        {
+            "code": raw["code"].astype(str),
+            "name": raw["name"].astype(str),
+            "found_date": pd.to_datetime(raw["found_date"]).dt.date,
+            "shares_yi": pd.to_numeric(raw["shares_yi"], errors="coerce"),
+            "fund_type": raw["fund_type"].astype(str),
+        }
+    )
+    n = upsert_dataframe(con, "fund_issue", out, key_cols=["code"])
+    touch_series(con, "fund_issue", last_date=_last(out, "found_date"), note="东财新成立募集份额")
+    return {**meta, "wrote": n}
+
+
+def ingest_holder_reduce(con) -> dict[str, Any]:
+    from data_source.dp_cycle.holder_reduce import fetch_holder_reduces
+
+    raw, meta = fetch_holder_reduces(start=HISTORY_START_STR)
+    if raw is None or raw.empty:
+        return {**meta, "wrote": 0}
+    out = pd.DataFrame(
+        {
+            "code": raw["code"].astype(str),
+            "holder": raw["holder"].astype(str),
+            "end_date": pd.to_datetime(raw["end_date"]).dt.date,
+            "notice_date": pd.to_datetime(raw["notice_date"]).dt.date,
+            "change_wan": pd.to_numeric(raw["change_wan"], errors="coerce"),
+            "close_price": pd.to_numeric(raw["close_price"], errors="coerce"),
+            "amount_yi": pd.to_numeric(raw["amount_yi"], errors="coerce"),
+        }
+    )
+    n = upsert_dataframe(con, "holder_reduce", out, key_cols=["code", "holder", "end_date", "notice_date"])
+    touch_series(con, "holder_reduce", last_date=_last(out, "end_date"), note="东财重要股东减持")
+    return {**meta, "wrote": n}
+
+
+def ingest_industry_flow(con) -> dict[str, Any]:
+    from data_source.dp_cycle.industry_flow import fetch_industry_flows
+
+    raw, meta = fetch_industry_flows()
+    raw = clip_from_2015(raw) if raw is not None and not raw.empty else raw
+    if raw is None or raw.empty:
+        return {**meta, "wrote": 0}
+    out = pd.DataFrame(
+        {
+            "date": pd.to_datetime(raw["date"]).dt.date,
+            "bk_code": raw["bk_code"].astype(str),
+            "name": raw["name"].astype(str),
+            "net_yi": pd.to_numeric(raw["net_yi"], errors="coerce"),
+            "mid_yi": pd.to_numeric(raw["mid_yi"], errors="coerce"),
+            "small_yi": pd.to_numeric(raw["small_yi"], errors="coerce"),
+        }
+    )
+    n = upsert_dataframe(con, "industry_flow_daily", out, key_cols=["date", "bk_code"])
+    touch_series(con, "industry_flow_daily", last_date=_last(out), note="东财行业主力近端日频")
+    return {**meta, "wrote": n}
+
+
 def update_dp_cycle_db(
     *,
     mode: str = "auto",
@@ -326,6 +397,7 @@ def update_dp_cycle_db(
     skip_high_low：跳过 K 线湖 52 周扫库；仍会拉乐咕 120 日快径。
     """
     con = connect()
+    _invalidate_load_cache()  # 入库前使缓存失效
     detail: dict[str, Any] = {"mode": mode, "index_symbol": index_symbol}
     ok = True
     try:
@@ -337,6 +409,9 @@ def update_dp_cycle_db(
         detail["margin"] = ingest_margin(con)
         detail["growth_value"] = ingest_growth_value(con)
         detail["unlock"] = ingest_unlock(con)
+        detail["fund_issue"] = ingest_fund_issue(con)
+        detail["holder_reduce"] = ingest_holder_reduce(con)
+        detail["industry_flow"] = ingest_industry_flow(con)
         detail["high_low_legu"] = ingest_high_low_legu(con)
         if skip_high_low:
             detail["high_low_lake"] = {"ok": True, "wrote": 0, "skipped": True}

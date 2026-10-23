@@ -14,6 +14,20 @@ from typing import Any
 
 import pandas as pd
 
+from data_source.dp_cycle.rules import (  # noqa: E402
+    DIVERGENCE_EXTREME,
+    HL_COLD_RATIO,
+    HL_HOT_RATIO,
+    NT_SHORT_WINDOW,
+    breadth_shape,
+    decide_retail_action_core,
+    divergence_shape,
+    score_breadth,
+    score_divergence,
+    score_margin_regime,
+    score_national_team_regime,
+)
+
 # 五档决策（页面首屏）
 DECISIONS: list[dict[str, Any]] = [
     {
@@ -248,44 +262,37 @@ def decide_retail_action(
 ) -> dict[str, Any]:
     """散户决策：硬信号优先，再看分数带。结论=离场/减仓/持有观望/加仓/抄底。"""
     reasons: list[str] = []
-    action_id: str | None = None
-
-    # 硬信号：别在别人撤退时接盘
-    if nt_zone == "high" and nt_trend == "out":
-        action_id = "exit"
-        reasons.append("郭嘉队高仓位还在减（最高优先）")
-    elif nt_zone == "high" and nt_trend in {"in", "flat"}:
-        action_id = "reduce"
-        reasons.append("郭嘉队高仓位拥挤/钝化，高位唱多段勿接")
-    elif margin_zone == "high" and margin_trend == "up":
-        action_id = "exit" if score <= -3 or behavior_bad else "reduce"
-        reasons.append("融资高位还在加，风险升，警惕离开")
-    elif margin_zone == "high" and margin_trend == "down":
-        action_id = "reduce"
-        reasons.append("融资高位去杠杆，杀杠杆未结束")
-    elif nt_zone == "low" and nt_trend == "in" and margin_zone in {"low", "mid", "gap"}:
-        action_id = "bottom"
-        reasons.append("郭嘉队低位加仓，托举段可抄底宽基")
-    elif margin_zone == "low" and margin_trend == "up" and score >= 2:
-        action_id = "add"
-        reasons.append("融资低位加杠杆，跟随加仓")
-    elif score <= -4:
-        action_id = "exit"
-        reasons.append(f"合计分 {score:+d}，多项同负")
-    elif score <= -2:
-        action_id = "reduce"
-        reasons.append(f"合计分 {score:+d}，偏防守")
-    elif score >= 3 and nt_zone == "low":
-        action_id = "bottom"
-        reasons.append(f"合计分 {score:+d} 且郭嘉队仓位偏低")
-    elif score >= 2:
-        action_id = "add"
-        reasons.append(f"合计分 {score:+d}，偏进攻")
-    else:
+    action_id = decide_retail_action_core(
+        score=score,
+        nt_zone=nt_zone,
+        nt_trend=nt_trend,
+        margin_zone=margin_zone,
+        margin_trend=margin_trend,
+        behavior_bad=behavior_bad,
+    )
+    if action_id is None:
         # 落到资金行为阶段的默认决策
         phase = phase_by_id(phase_id)
         action_id = str(phase.get("decision") or "hold")
         reasons.append(f"落在资金行为「{phase.get('stage')}」段")
+    else:
+        # 硬信号原因
+        if action_id == "exit" and nt_zone == "high" and nt_trend == "out":
+            reasons.append("郭嘉队高仓位还在减（最高优先）")
+        elif action_id == "reduce" and nt_zone == "high":
+            reasons.append("郭嘉队高仓位拥挤/钝化，高位唱多段勿接")
+        elif action_id == "exit" and margin_zone == "high" and margin_trend == "up":
+            reasons.append("融资高位还在加，风险升，警惕离开")
+        elif action_id == "reduce" and margin_zone == "high" and margin_trend == "down":
+            reasons.append("融资高位去杠杆，杀杠杆未结束")
+        elif action_id == "bottom" and nt_zone == "low" and nt_trend == "in":
+            reasons.append("郭嘉队低位加仓，托举段可抄底宽基")
+        elif action_id == "add" and margin_zone == "low" and margin_trend == "up":
+            reasons.append("融资低位加杠杆，跟随加仓")
+        elif action_id in {"exit", "reduce"}:
+            reasons.append(f"合计分 {score:+d}，偏防守")
+        elif action_id in {"add", "bottom"}:
+            reasons.append(f"合计分 {score:+d}，偏进攻")
 
     row = dict(_DECISION_BY_ID.get(action_id) or _DECISION_BY_ID["hold"])
     # 仓位带：硬离场用决策带；否则与阶段带取更保守一侧（卖侧取低，买侧取阶段）
@@ -340,7 +347,7 @@ def monthly_regimes(bundle: dict[str, Any]) -> list[dict[str, Any]]:
         ["new_high", "new_low"],
     )
     month_last = margin.groupby(margin["date"].dt.to_period("M"), as_index=False).tail(1)
-    from data_source.dp_cycle.diagnosis import _as_pct, score_margin_regime, score_national_team_regime
+    from data_source.dp_cycle.diagnosis import _as_pct
 
     etf_m = bundle.get("etf_monthly") if isinstance(bundle.get("etf_monthly"), pd.DataFrame) else pd.DataFrame()
     etf = pd.DataFrame()
@@ -368,7 +375,11 @@ def monthly_regimes(bundle: dict[str, Any]) -> list[dict[str, Any]]:
             past_e = etf.loc[etf["date"] <= end]
             if len(past_e) >= 6:
                 shares = float(past_e["份额_亿份"].iloc[-1])
-                pct_nt = float((past_e["份额_亿份"] <= shares).mean() * 100.0)
+                # 双轨分位
+                pct_all = float((past_e["份额_亿份"] <= shares).mean() * 100.0)
+                short_hist = past_e["份额_亿份"].tail(NT_SHORT_WINDOW)
+                pct_short = float((short_hist <= shares).mean() * 100.0) if len(short_hist) >= 12 else pct_all
+                pct_nt = max(pct_all, pct_short) if pct_all >= 50 else min(pct_all, pct_short)
                 if "月变动_亿份" in past_e.columns and pd.notna(past_e["月变动_亿份"].iloc[-1]):
                     d_nt = float(past_e["月变动_亿份"].iloc[-1])
                 else:
@@ -384,25 +395,13 @@ def monthly_regimes(bundle: dict[str, Any]) -> list[dict[str, Any]]:
                 earlier = past.loc[past["date"] <= end - pd.Timedelta(days=60)]
                 if not earlier.empty:
                     div_prev = float(earlier["偏离度"].iloc[-1])
-        if div_now is None:
-            div_shape = "gap"
-        elif div_now >= 16:
-            div_shape = "extreme"
-        elif div_prev is not None and div_prev >= 15 and div_now < div_prev - 0.4:
-            div_shape = "narrowing"
-        else:
-            div_shape = "calm"
+        div_shape = "gap" if div_now is None else divergence_shape(div_now, div_prev)
         br_shape = "gap"
         if not hl.empty and {"new_high", "new_low"}.issubset(hl.columns):
             tail = hl.loc[hl["date"] <= end].dropna(subset=["new_high", "new_low"]).tail(5)
             if not tail.empty:
                 ratio = float(tail["new_high"].mean()) / max(float(tail["new_low"].mean()), 1.0)
-                if ratio >= 8:
-                    br_shape = "hot"
-                elif ratio <= 0.2:
-                    br_shape = "cold"
-                else:
-                    br_shape = "mixed"
+                br_shape = breadth_shape(ratio, False)
         phase_id = choose_phase(
             margin_zone=m_zone,
             margin_trend=m_trend,

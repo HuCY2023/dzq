@@ -71,7 +71,18 @@ def _parse_klines(klines: list[str]) -> pd.DataFrame:
 
 def union_main_force_frames(*frames: pd.DataFrame) -> pd.DataFrame:
     """按日期合并多份主力日频。后出现的帧覆盖同一天，更早的日期保留。"""
-    cols = ["date", "净额_亿元", "流入_亿元", "流出_亿元", "行业数", "source"]
+    cols = [
+        "date",
+        "净额_亿元",
+        "小单_亿元",
+        "中单_亿元",
+        "大单_亿元",
+        "超大单_亿元",
+        "流入_亿元",
+        "流出_亿元",
+        "行业数",
+        "source",
+    ]
     parts: list[pd.DataFrame] = []
     for frame in frames:
         if frame is None or getattr(frame, "empty", True):

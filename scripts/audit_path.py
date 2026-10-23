@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """One-shot audit of DP cycle deduction path. Run from repo with PYTHONPATH=src."""
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ for _p in (_ROOT, _ROOT / 'src'):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+
 import pandas as pd
 from data_source.dp_cycle.gui_bundle import load_dp_cycle_gui_bundle
 from data_source.dp_cycle.diagnosis import (
@@ -17,6 +18,7 @@ from data_source.dp_cycle.diagnosis import (
     score_national_team_regime,
     _as_pct,
 )
+from data_source.dp_cycle.rules import NT_SHORT_WINDOW
 
 
 def cov(name, df):
@@ -95,10 +97,14 @@ def main() -> None:
         e["份额_亿份"] = pd.to_numeric(e["份额_亿份"], errors="coerce")
         e = e.dropna(subset=["份额_亿份"])
         shares = float(e["份额_亿份"].iloc[-1])
-        pct = float((e["份额_亿份"] <= shares).mean() * 100)
+        # 双轨分位：全样本 + 近 N 月
+        pct_all = float((e["份额_亿份"] <= shares).mean() * 100)
+        short_hist = e["份额_亿份"].tail(NT_SHORT_WINDOW)
+        pct_short = float((short_hist <= shares).mean() * 100) if len(short_hist) >= 12 else pct_all
+        pct = max(pct_all, pct_short) if pct_all >= 50 else min(pct_all, pct_short)
         delta = float(pd.to_numeric(e["月变动_亿份"], errors="coerce").iloc[-1])
         sc, z, t, _tag = score_national_team_regime(pct, delta)
-        print(f"\nNT recalc: shares={shares:.1f} pct={pct:.1f} delta={delta:+.1f} -> {sc} {z} {t}")
+        print(f"\nNT recalc: shares={shares:.1f} pct_all={pct_all:.1f} pct_short={pct_short:.1f} -> pct={pct:.1f} delta={delta:+.1f} -> {sc} {z} {t}")
         if sc != nt["score"] or z != nt.get("zone"):
             issues.append(f"FAIL: NT mismatch {nt['score']}/{nt.get('zone')} vs {sc}/{z}")
 
@@ -117,9 +123,10 @@ def main() -> None:
     mf = b.get("main_force_daily")
     if mf is None or getattr(mf, "empty", True) or len(mf) < 20:
         print("MAIN_FORCE: gap — cannot score weekly outflow (author compass incomplete)")
-    if nt.get("zone") == "mid":
+    if nt.get("zone") == "mid" and nt.get("pct_all", 50) >= 50:
         print(
-            "NT_ZONE: mid — expanding percentile on short ETF history can understate "
+            "NT_ZONE: mid — dual-track chose full-sample over short-window; "
+            "expanding percentile on short ETF history can understate "
             "'high inventory' vs author Huijin/CSFC levels"
         )
     if pct is not None and pct >= 75 and t == "down":
@@ -147,4 +154,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

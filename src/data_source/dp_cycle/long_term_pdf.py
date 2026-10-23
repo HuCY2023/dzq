@@ -44,38 +44,69 @@ def _cover(pdf: PdfPages, *, as_of: str, diagnosis: dict[str, Any], total: int) 
     ax.set_ylim(0, 1)
     ax.axis("off")
     ax.add_patch(plt.Rectangle((0, 0.78), 1, 0.22, color="#0f2744", transform=ax.transAxes, clip_on=False))
-    ax.text(0.05, 0.90, "大周期 · 大盘位置", fontsize=26, color="white", fontweight="bold", transform=ax.transAxes)
-    ax.text(0.05, 0.83, f"长期跟踪  ·  截至 {as_of}", fontsize=12, color="#c5d4e8", transform=ax.transAxes)
+    ax.text(0.05, 0.90, "大周期 · 散户决策", fontsize=26, color="white", fontweight="bold", transform=ax.transAxes)
+    ax.text(0.05, 0.83, f"视频全量口径 · 长期跟踪  ·  截至 {as_of}", fontsize=12, color="#c5d4e8", transform=ax.transAxes)
 
     pos = diagnosis.get("position") or {}
+    dec = diagnosis.get("decision") or {}
     score = diagnosis.get("score")
     score_txt = "—" if score is None else f"{int(score):+d}"
     tone = "#7a2e22" if isinstance(score, (int, float)) and score < 0 else "#0f2744"
 
-    ax.text(0.05, 0.70, diagnosis.get("state") or "—", fontsize=22, fontweight="bold", color=tone, transform=ax.transAxes)
-    ax.text(0.05, 0.64, diagnosis.get("summary") or "", fontsize=11, color="#333", transform=ax.transAxes)
     ax.text(
         0.05,
-        0.58,
-        f"仓位 {pos.get('equity_text') or '—'}  ·  {pos.get('actor') or ''}  ·  {pos.get('sleeve') or ''}",
+        0.72,
+        dec.get("label") or diagnosis.get("state") or "—",
+        fontsize=22,
+        fontweight="bold",
+        color=tone,
+        transform=ax.transAxes,
+    )
+    ax.text(0.05, 0.66, diagnosis.get("state") or "", fontsize=12, color="#555", transform=ax.transAxes)
+    ax.text(0.05, 0.61, diagnosis.get("summary") or "", fontsize=11, color="#333", transform=ax.transAxes)
+    ax.text(
+        0.05,
+        0.55,
+        f"仓位 {dec.get('equity_text') or pos.get('equity_text') or '—'}  ·  "
+        f"{pos.get('actor') or ''}  ·  {pos.get('sleeve') or ''}",
         fontsize=11,
         color="#222",
         transform=ax.transAxes,
     )
+    k_type = diagnosis.get("k_type") or {}
+    if k_type.get("hint"):
+        ax.text(
+            0.05,
+            0.50,
+            f"K型：{k_type.get('mode') or ''} — {k_type.get('hint')}",
+            fontsize=9,
+            color="#555",
+            transform=ax.transAxes,
+        )
 
     ax.add_patch(plt.Rectangle((0.72, 0.52), 0.23, 0.20, facecolor="#f5f7fa", edgecolor="#d0d7e2", transform=ax.transAxes))
     ax.text(0.835, 0.68, "总分", fontsize=10, ha="center", color="#666", transform=ax.transAxes)
     ax.text(0.835, 0.58, score_txt, fontsize=32, ha="center", fontweight="bold", color=tone, transform=ax.transAxes)
-    ax.text(0.05, 0.52, diagnosis.get("score_note") or "", fontsize=9, color="#555", transform=ax.transAxes)
-    ax.text(0.05, 0.48, diagnosis.get("score_logic") or "", fontsize=9, color="#666", transform=ax.transAxes)
+    ax.text(0.05, 0.45, diagnosis.get("score_note") or "", fontsize=9, color="#555", transform=ax.transAxes)
+    ax.text(0.05, 0.41, diagnosis.get("score_logic") or "", fontsize=8, color="#666", transform=ax.transAxes)
 
-    ax.text(0.05, 0.43, "结论节点", fontsize=12, fontweight="bold", color="#0f2744", transform=ax.transAxes)
+    red = diagnosis.get("red_light") or {}
+    ax.text(
+        0.05,
+        0.36,
+        red.get("note") or "红灯四件套：偏离 · 高低比 · 高杠杆 · 外盘",
+        fontsize=9,
+        color="#7a2e22" if red.get("severe") else "#555",
+        transform=ax.transAxes,
+    )
+
+    ax.text(0.05, 0.31, "三种系统性风险", fontsize=12, fontweight="bold", color="#0f2744", transform=ax.transAxes)
     nodes = diagnosis.get("nodes") or []
     cols = 3
     for i, nd in enumerate(nodes):
         r, c = divmod(i, cols)
         x0 = 0.05 + c * 0.31
-        y0 = 0.36 - r * 0.12
+        y0 = 0.24 - r * 0.12
         st = nd.get("status") or "gap"
         edge = {"on": "#c45c26", "watch": "#c9a227", "off": "#2f5a42", "gap": "#d0d7e2"}.get(st, "#d0d7e2")
         face = {"on": "#f8e8e4", "watch": "#f7f0d8", "off": "#e8f3ec", "gap": "#f5f7fa"}.get(st, "#f5f7fa")
@@ -114,9 +145,16 @@ def _score_page(pdf: PdfPages, *, as_of: str, diagnosis: dict[str, Any], page: i
         if y < 0.18:
             break
 
+    red = diagnosis.get("red_light") or {}
+    flags = red.get("flags") or []
+    if flags:
+        bits = " · ".join(
+            f"{f.get('label')}({'亮' if f.get('on') else '灭'})" for f in flags
+        )
+        ax.text(0.0, 0.16, "红灯：" + bits, fontsize=8, color="#7a2e22", transform=ax.transAxes)
     gaps = diagnosis.get("gaps") or []
     if gaps:
-        ax.text(0.0, 0.12, "缺口：" + "；".join(str(g) for g in gaps), fontsize=8, color="#666", transform=ax.transAxes)
+        ax.text(0.0, 0.11, "缺口：" + "；".join(str(g) for g in gaps[:4]), fontsize=8, color="#666", transform=ax.transAxes)
     _footer(ax, page, total, as_of)
     _page(fig, pdf)
 
@@ -231,18 +269,18 @@ def _method_page(pdf: PdfPages, *, as_of: str, page: int, total: int) -> None:
     ax.set_title("口径 · 数据源 · 使用说明", fontsize=16, loc="left", color="#0f2744", pad=10)
 
     lines = [
-        "01 主力资金：东财大盘大单+超大单净额。只作风控。月均约−4000、周流出≥2000 才计负分。",
-        "    大单分类≠股东身份。偶发净流入不当作看多。长历史仍短于作者的两年月柱。",
-        "02 国家队代理：上交所 ETF 份额（510300/510310/510330 等）月变动；申赎代理≠汇金/证金净交易。",
-        "    159919 在深市，SSE 表可能缺失。",
-        "03 杠杆资金：沪+深融资余额（亿元）、月末变化、全样本分位与近5年分位。月两融≠日融资混用。",
-        "04 成长价值偏离：乐咕 创业板50 / 上证50；(PE比+PB比)/2；作者经验值17仅对照。",
-        "05 52周新高−新低：K 线湖约 252 日。未剔 ST。高低比约 10:1 偏热，约 1:10 偏冷。",
-        "06 解禁：东财实际解禁市值，月/季，全市场与科创板。解禁月之后两三个月主力流出容易偏高。",
-        "打分：有数的项按档加减，缺的不记 0。结论节点见首页。仓位见资金行为图，research/DP/大周期/框架.md。",
+        "视频口径：资金侧边际变差共振 → 打分 → 散户五档决策。日常 ±1/±2；多项同负才极端（如 −9）。",
+        "A 资金三件套：主力（只作风控）· 郭嘉队ETF份额代理（≠汇金净流入）· 融资分位×方向。",
+        "B 行为：成长–价值偏离≈17；52周高低比热~10:1 / 空~1:10（湖扫未剔 ST）。",
+        "C 解禁：提前约一年；高峰后 2–3 月主力易偏高。",
+        "D −9 扩展：剪刀差 / 公募新发腰斩 / 减持+75% / 科技流出银行不接（有数才进分）。",
+        "E 旁证：A股成交拥挤度、科创IV、美股保证金/M2（默认不进合计分）。",
+        "红灯四件套：偏离极值 + 高低比背离 + 高杠杆 + 外盘脆弱；扳机仍是资金边际。",
+        "决策：硬信号优先（郭嘉队高位减→离场；融资高位加/杀→减仓）。缺的不记 0。",
+        "权威：research/DP/大周期/框架.md · 散户决策_推演核查.md",
         "",
-        "长期跟踪建议：每个交易日跑 scripts/research/run_dp_five_indicators.py，积累 01/02 增量序列。",
-        "稳定最新副本：output/user/dp_cycle/大周期五项指标_长期跟踪.pdf",
+        "入库：scripts/research/update_dp_cycle_db.py 或每日 run_dp_cycle_daily.py",
+        "稳定 PDF：output/user/dp_cycle/大周期五项指标_长期跟踪.pdf",
         "",
         "免责声明：",
         DISCLAIMER_BODY_CN,
@@ -352,7 +390,13 @@ def build_long_term_pdf(
             "growth_value": tables.get("growth_value"),
             "high_low": tables.get("high_low"),
             "unlock_daily": tables.get("unlock_daily"),
-        }
+            "etf_monthly": tables.get("etf_monthly") or tables.get("etf_shares_daily"),
+            "fund_issue": tables.get("fund_issue"),
+            "holder_reduce": tables.get("holder_reduce"),
+            "industry_flow_daily": tables.get("industry_flow_daily"),
+            "us_crowding": tables.get("us_crowding") if isinstance(tables.get("us_crowding"), dict) else None,
+        },
+        heavy=True,
     )
     # cover + score + position + dashboard + charts + method
     total = 4 + len(chart_specs) + 1

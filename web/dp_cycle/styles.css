@@ -542,6 +542,55 @@ button.q-badge {
   font-size: 11px;
 }
 
+.red-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.red-card {
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: #12161e;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.red-card.on {
+  border-color: #8a3a32;
+  background: #1c1214;
+}
+
+.red-card .rt { font-weight: 700; }
+.red-card .rs {
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+.red-card.on .rs { color: #ef8b7a; }
+.red-card .rn { margin-top: 2px; color: var(--muted); font-size: 10px; }
+
+.red-note {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.red-note.severe { color: #ef8b7a; }
+
+.k-type {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.layers-host {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 .node-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
