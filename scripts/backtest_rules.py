@@ -12,7 +12,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from data_source.dp_cycle.evaluation import DEFAULT_ONE_WAY_COST, evaluate_allocation
+from data_source.dp_cycle.evaluation import DEFAULT_ONE_WAY_COST, evaluate_allocation, purged_time_split
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -24,6 +24,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, help="可选：在该目录创建独立运行记录")
     parser.add_argument("--one-way-cost", type=float, default=DEFAULT_ONE_WAY_COST,
                         help="单边成本比例；默认 0.0005，敏感性检查可用 0.001")
+    parser.add_argument("--train-end", help="预先指定训练集截止日期")
+    parser.add_argument("--validation-end", help="预先指定验证集截止日期")
+    parser.add_argument("--test-end", help="测试集截止日期，默认日历最后一天")
+    parser.add_argument("--label-horizon", type=int, default=60, help="未来标签的交易日间隔，默认 60")
     args = parser.parse_args(argv)
     if not all((args.prices, args.signals, args.calendar, args.evidence)):
         result = {"status": "BLOCK", "reasons": [
@@ -40,6 +44,16 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("日历缺 date 列或证据不是 JSON 对象")
             result = evaluate_allocation(prices, signals, evidence, trading_dates=calendar["date"],
                                          one_way_cost=args.one_way_cost)
+            if any((args.train_end, args.validation_end, args.test_end)) and result["status"] != "BLOCK":
+                if not args.train_end or not args.validation_end:
+                    raise ValueError("时间分区需要同时提供训练和验证截止日")
+                split = purged_time_split(calendar["date"], train_end=args.train_end,
+                                          validation_end=args.validation_end, test_end=args.test_end,
+                                          label_horizon=args.label_horizon)
+                result["split"] = split
+                result["limitations"].append("时间分区仅记录交易日候选边界，不代表已有信号；净值指标仍为全区间，尚未完成分区外评价。")
+                if split["status"] != "OK":
+                    result["status"] = "DATA_PARTIAL"
         except (OSError, ValueError, pd.errors.ParserError) as exc:
             result = {"status": "BLOCK", "reasons": [f"输入无法核验：{exc}"]}
     if args.output:
