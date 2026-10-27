@@ -1282,6 +1282,20 @@
           "。估算可能包含转托管，非实际现金流，也不能识别交易主体；历史不用于可交易回测。该快照需手动重新导入。";
       }
     }
+    const holderText = el("etfHolderText");
+    if (holderText) {
+      const disclosures = data.etf_holder_disclosures || {};
+      holderText.textContent = disclosures.display || "尚未核验持有人报告。";
+      const report = (disclosures.items || []).find((item) => item.code === "159919" && item.source_url);
+      if (report && report.source_url.startsWith("https://")) {
+        const link = document.createElement("a");
+        link.href = report.source_url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = " 查看原报告";
+        holderText.appendChild(link);
+      }
+    }
     try { renderQuality(data); } catch (e) { console.warn("renderQuality", e); }
     try { renderDiagnosis(data); } catch (e) { console.warn("renderDiagnosis", e); }
 
