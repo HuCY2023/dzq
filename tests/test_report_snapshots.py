@@ -17,16 +17,20 @@ spec.loader.exec_module(script)
 
 
 class ReportSnapshotsTests(unittest.TestCase):
-    def _run(self, root, *, score, fail_pdf=False, flow_source=None, change_events=False):
+    def _run(self, root, *, score, fail_pdf=False, flow_source=None, change_events=False, change_disclosures=False):
         out = Path(root, "dated")
         store = Path(root, "store")
         events = Path(root, "etf_share_events.csv")
         if not events.exists():
             events.write_text("code,event_date,ratio\n510300,2024-01-01,2\n", encoding="utf-8")
+        disclosures = Path(root, "etf_holder_disclosures.csv")
+        if not disclosures.exists():
+            disclosures.write_text("code,period_end\n159919,2026-06-30\n", encoding="utf-8")
         bundle = {"meta": {"weekly": {"ok": True}, "as_of": "2026-10-27",
                            "trade_calendar": {"origin": "test"}},
                   "weekly": pd.DataFrame({"date": ["2026-10-23"], "close": [100]}),
-                  "trade_calendar": {"dates": ["2026-10-23"], "source": "test"}}
+                  "trade_calendar": {"dates": ["2026-10-23"], "source": "test"},
+                  "etf_holder_disclosures": {"as_of": "2026-10-27", "status": "partial"}}
         if flow_source is not None:
             bundle["etf_flow"] = {"source": {"snapshot": str(flow_source)}}
         diagnosis = {"as_of": "2026-10-27", "rule_version": "improved_v1", "score": score,
@@ -44,9 +48,11 @@ class ReportSnapshotsTests(unittest.TestCase):
         def fake_payload(*args, **kwargs):
             if change_events:
                 events.write_text("changed during report", encoding="utf-8")
+            if change_disclosures:
+                disclosures.write_text("changed during report", encoding="utf-8")
             return payload
 
-        with patch.object(script, "SHARE_EVENTS_PATH", events), patch("sys.argv", ["build_web_report", "--pdf"]), patch(
+        with patch.object(script, "SHARE_EVENTS_PATH", events), patch.object(script, "HOLDER_DISCLOSURES_PATH", disclosures), patch("sys.argv", ["build_web_report", "--pdf"]), patch(
             "output_paths.dp_cycle_dir", return_value=str(out)
         ), patch("output_paths.dp_cycle_store_dir", return_value=str(store)), patch(
             "data_source.dp_cycle.gui_bundle.load_dp_cycle_gui_bundle", return_value=bundle
@@ -68,6 +74,9 @@ class ReportSnapshotsTests(unittest.TestCase):
             self.assertEqual(manifests[-1]["data_availability"]["margin"]["observation_date"], "2026-10-26")
             self.assertTrue((runs[0] / "inputs" / "weekly.csv").is_file())
             self.assertTrue((runs[0] / "inputs" / "trade_calendar.json").is_file())
+            archived_disclosures = runs[0] / "inputs" / "etf_holder_disclosures.csv"
+            self.assertEqual(archived_disclosures.read_bytes(), Path(tmp, "etf_holder_disclosures.csv").read_bytes())
+            self.assertEqual(json.loads((runs[0] / "inputs" / "etf_holder_disclosures.json").read_text(encoding="utf-8"))["status"], "partial")
             archived_events = runs[0] / "inputs" / "etf_share_events.csv"
             self.assertEqual(archived_events.read_bytes(), Path(tmp, "etf_share_events.csv").read_bytes())
             self.assertEqual(manifests[0]["artifacts"]["etf_share_events"], str(archived_events))
@@ -114,6 +123,16 @@ class ReportSnapshotsTests(unittest.TestCase):
             before = html.read_bytes(), pdf.read_bytes()
             with self.assertRaisesRegex(RuntimeError, "ETF 份额事件表在报告生成期间发生变化"):
                 self._run(tmp, score=2, change_events=True)
+            self.assertEqual((html.read_bytes(), pdf.read_bytes()), before)
+
+    def test_disclosure_table_change_during_report_preserves_existing_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._run(tmp, score=1), 0)
+            html = Path(tmp, "store", "web_snapshot", "index.html")
+            pdf = Path(tmp, "store", "大周期五项指标_长期跟踪.pdf")
+            before = html.read_bytes(), pdf.read_bytes()
+            with self.assertRaisesRegex(RuntimeError, "持有人披露表在报告生成期间发生变化"):
+                self._run(tmp, score=2, change_disclosures=True)
             self.assertEqual((html.read_bytes(), pdf.read_bytes()), before)
 
     def test_previous_legacy_report_and_pdfs_remain_openable(self):

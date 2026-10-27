@@ -16,7 +16,7 @@ class Element {
 
 const names = ["diagState", "diagScore", "scoreBig", "scoreLogic", "scoreSumBar",
   "scoreFormula", "scoreTableBody", "scoreBoardHint", "layersHost", "currentWeek", "empty",
-  "redLightGrid", "redLightHint", "redLightNote", "analysisDate", "etfFlowText"];
+  "redLightGrid", "redLightHint", "redLightNote", "analysisDate", "etfFlowText", "etfHolderText"];
 const elements = Object.fromEntries(names.map((name) => [name, new Element()]));
 const document = {
   getElementById: (name) => elements[name] || null,
@@ -29,7 +29,11 @@ vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../web/dp_cycle/app.js"
   setTimeout: () => 1, clearTimeout() {}, console,
 });
 
-window.renderDpCycle({ etf_flow: {status: "partial", date: "2026-10-26", flow_yi: 217.1622, source: {events_recorded: false},
+window.renderDpCycle({ etf_holder_disclosures: {coverage: {verified_reports: 1, expected: 4},
+  display: "已核验基金报告 1/4 只。159919 报告期 2026-06-30，公告 2026-08-31，未披露实名持有人。最近实名快照为 2025-12-31，不能作为当前持仓。", items: [
+  {code: "159919", status: "not_disclosed", period_end: "2026-06-30", published_date: "2026-08-31",
+   source_url: "https://static.cninfo.com.cn/example.pdf", last_named: {period_end: "2025-12-31", direct_shares: 35498494985}}]},
+  etf_flow: {status: "partial", date: "2026-10-26", flow_yi: 217.1622, source: {events_recorded: false},
   coverage: {comparable: 4, expected: 4}, reason: "截至日覆盖未知",
   components: [{code: "159919", flow_yi: 18.2621}]}, diagnosis: {
   score: 0,
@@ -65,6 +69,8 @@ assert.match(elements.etfFlowText.textContent, /截至日覆盖未知/);
 assert.match(elements.etfFlowText.textContent, /估算.*非.*现金流/);
 assert.match(elements.etfFlowText.textContent, /事件表.*未留存/);
 assert.match(elements.etfFlowText.textContent, /手动.*导入/);
+assert.match(elements.etfHolderText.textContent, /1\/4.*159919.*2026-06-30.*2026-08-31.*未披露.*实名/);
+assert.match(elements.etfHolderText.textContent, /2025-12-31.*不能.*当前/);
 assert.match(elements.redLightGrid.children[0].innerHTML, />未知</);
 assert.match(elements.redLightGrid.children[1].innerHTML, />灭</);
 assert.match(elements.redLightHint.textContent, /已知 1\/4/);
