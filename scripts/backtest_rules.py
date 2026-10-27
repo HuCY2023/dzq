@@ -12,7 +12,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from data_source.dp_cycle.evaluation import evaluate_allocation
+from data_source.dp_cycle.evaluation import DEFAULT_ONE_WAY_COST, evaluate_allocation
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -22,6 +22,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--calendar", type=Path, help="与价格区间一致、含 date 列的交易日历 CSV")
     parser.add_argument("--evidence", type=Path, help="标的、来源、复权/分红及历史版本证据 JSON")
     parser.add_argument("--output", type=Path, help="可选：在该目录创建独立运行记录")
+    parser.add_argument("--one-way-cost", type=float, default=DEFAULT_ONE_WAY_COST,
+                        help="单边成本比例；默认 0.0005，敏感性检查可用 0.001")
     args = parser.parse_args(argv)
     if not all((args.prices, args.signals, args.calendar, args.evidence)):
         result = {"status": "BLOCK", "reasons": [
@@ -36,7 +38,8 @@ def main(argv: list[str] | None = None) -> int:
             evidence = json.loads(args.evidence.read_text(encoding="utf-8"))
             if "date" not in calendar.columns or not isinstance(evidence, dict):
                 raise ValueError("日历缺 date 列或证据不是 JSON 对象")
-            result = evaluate_allocation(prices, signals, evidence, trading_dates=calendar["date"])
+            result = evaluate_allocation(prices, signals, evidence, trading_dates=calendar["date"],
+                                         one_way_cost=args.one_way_cost)
         except (OSError, ValueError, pd.errors.ParserError) as exc:
             result = {"status": "BLOCK", "reasons": [f"输入无法核验：{exc}"]}
     if args.output:
