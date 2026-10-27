@@ -12,13 +12,14 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from data_source.dp_cycle.evaluation import DEFAULT_ONE_WAY_COST, evaluate_allocation, purged_time_split
+from data_source.dp_cycle.evaluation import DEFAULT_ONE_WAY_COST, evaluate_allocation, evaluate_warning_windows, purged_time_split
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="仅在时点、交易价格和总收益复权凭证齐全时回放配置。")
     parser.add_argument("--prices", type=Path, help="含交易日、真实开盘、总收益复权开盘及可成交状态的 CSV")
     parser.add_argument("--signals", type=Path, help="含信号生成时间、数据可得时间和目标仓位的 CSV；缺失目标会撤销待执行指令")
+    parser.add_argument("--warnings", type=Path, help="可选：含预警生成时间、数据可得时间和 warning 状态的 CSV")
     parser.add_argument("--calendar", type=Path, help="与价格区间一致、含 date 列的交易日历 CSV")
     parser.add_argument("--evidence", type=Path, help="标的、来源、复权/分红及历史版本证据 JSON")
     parser.add_argument("--output", type=Path, help="可选：在该目录创建独立运行记录")
@@ -44,6 +45,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("日历缺 date 列或证据不是 JSON 对象")
             result = evaluate_allocation(prices, signals, evidence, trading_dates=calendar["date"],
                                          one_way_cost=args.one_way_cost)
+            if args.warnings and result["status"] != "BLOCK":
+                warnings = pd.read_csv(args.warnings)
+                warning_windows = evaluate_warning_windows(prices, warnings, evidence, trading_dates=calendar["date"])
+                result["warning_windows"] = warning_windows
+                if warning_windows["status"] != "OK":
+                    result["status"] = "DATA_PARTIAL"
+                result["limitations"].append("预警仅计算全输入区间内不重叠的开盘观察窗口，尚未按分区统计或定义误报、漏报。")
             if any((args.train_end, args.validation_end, args.test_end)) and result["status"] != "BLOCK":
                 if not args.train_end or not args.validation_end:
                     raise ValueError("时间分区需要同时提供训练和验证截止日")
@@ -65,7 +73,9 @@ def main(argv: list[str] | None = None) -> int:
     if result["status"] == "OK":
         print("计算已完成；验证协议尚未完成，不能据此认定规则有效。")
     elif result["status"] == "DATA_PARTIAL":
-        print("存在未知判断；回放保留已有仓位，结果仅供检查，不能视为完整规则评价。")
+        print("部分输入或判断不完整；结果仅供检查，不能视为完整规则评价。")
+    for reason in (result.get("warning_windows") or {}).get("reasons", []):
+        print(f"预警范围：{reason}")
     for reason in result.get("reasons", []):
         print(f"原因：{reason}")
     for limitation in result.get("limitations", []):
