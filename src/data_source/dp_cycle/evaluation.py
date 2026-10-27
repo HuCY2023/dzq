@@ -186,6 +186,44 @@ def purged_time_split(
             "note": "仅按交易日生成候选日期和标签边界，不代表当日已有信号；不能替代历史版本核验或分区外评价。"}
 
 
+def _evidence_error(evidence: dict[str, Any]) -> str | None:
+    required = ("symbol", "price_source", "calendar_source", "price_adjustment_evidence",
+                "dividend_treatment", "signal_vintage_evidence")
+    missing = [name for name in required if not evidence.get(name)]
+    verified = ("calendar_verified", "point_in_time_verified", "execution_prices_verified", "total_return_verified")
+    if (missing or evidence.get("instrument_type") not in {"ETF", "stock"}
+            or evidence.get("market") != "CN_A_SHARE"
+            or any(evidence.get(name) is not True for name in verified)):
+        return "缺少可交易标的、交易日历、复权/分红或历史信号可得版本的证明"
+    return None
+
+
+def _prepare_prices(prices: pd.DataFrame, trading_dates: Iterable[Any] | None) -> tuple[pd.DataFrame | None, str | None]:
+    need_prices = {"date", "actual_open", "total_return_open", "tradable"}
+    if not isinstance(prices, pd.DataFrame) or prices.empty or not need_prices.issubset(prices.columns):
+        return None, "缺少可交易价格或总收益复权价格"
+    p = prices.copy()
+    p["date"] = pd.to_datetime(p["date"], errors="coerce").dt.normalize()
+    if p["date"].isna().any() or p["date"].duplicated().any():
+        return None, "价格交易日缺失或重复"
+    p = p.sort_values("date").reset_index(drop=True)
+    calendar = pd.to_datetime(list(trading_dates) if trading_dates is not None else [], errors="coerce")
+    calendar = pd.DatetimeIndex(calendar).normalize().sort_values()
+    if calendar.isna().any() or calendar.has_duplicates or list(calendar) != list(p["date"]):
+        return None, "交易日历与价格序列不一致"
+    tradable = p["tradable"].map({True: True, False: False, 1: True, 0: False, "true": True, "false": False, "True": True, "False": False})
+    if tradable.isna().any():
+        return None, "缺少可成交状态"
+    p["tradable"] = tradable.astype(bool)
+    for col in ("actual_open", "total_return_open"):
+        p[col] = pd.to_numeric(p[col], errors="coerce")
+    if (p["total_return_open"].isna() | ~np.isfinite(p["total_return_open"]) | p["total_return_open"].le(0)).any() or (
+        p["tradable"] & (p["actual_open"].isna() | ~np.isfinite(p["actual_open"]) | p["actual_open"].le(0))
+    ).any():
+        return None, "价格缺失，不能用零收益或其他日期代替"
+    return p, None
+
+
 def evaluate_allocation(
     prices: pd.DataFrame, signals: pd.DataFrame, evidence: dict[str, Any], *,
     trading_dates: Iterable[Any] | None, one_way_cost: float = DEFAULT_ONE_WAY_COST,
@@ -199,41 +237,17 @@ def evaluate_allocation(
     records the unfinished validation protocol. A missing target is an unknown
     decision: it cancels any pending instruction and retains the current holdings.
     """
-    required = ("symbol", "price_source", "calendar_source", "price_adjustment_evidence",
-                "dividend_treatment", "signal_vintage_evidence")
-    missing = [name for name in required if not evidence.get(name)]
-    verified = ("calendar_verified", "point_in_time_verified", "execution_prices_verified", "total_return_verified")
-    if (missing or evidence.get("instrument_type") not in {"ETF", "stock"}
-            or evidence.get("market") != "CN_A_SHARE"
-            or any(evidence.get(name) is not True for name in verified)):
-        return _block("缺少可交易标的、交易日历、复权/分红或历史信号可得版本的证明")
+    error = _evidence_error(evidence)
+    if error:
+        return _block(error)
     if not 0 <= one_way_cost < 1:
         return _block("交易成本不在有效范围")
-    need_prices = {"date", "actual_open", "total_return_open", "tradable"}
+    p, error = _prepare_prices(prices, trading_dates)
+    if error:
+        return _block(error)
     need_signals = {"signal_at", "available_at", "target_equity"}
-    if not isinstance(prices, pd.DataFrame) or prices.empty or not need_prices.issubset(prices.columns):
-        return _block("缺少可交易价格或总收益复权价格")
     if not isinstance(signals, pd.DataFrame) or not need_signals.issubset(signals.columns):
         return _block("缺少信号生成时间、可得时间或目标仓位")
-    p = prices.copy()
-    p["date"] = pd.to_datetime(p["date"], errors="coerce").dt.normalize()
-    if p["date"].isna().any() or p["date"].duplicated().any():
-        return _block("价格交易日缺失或重复")
-    p = p.sort_values("date").reset_index(drop=True)
-    calendar = pd.to_datetime(list(trading_dates) if trading_dates is not None else [], errors="coerce")
-    calendar = pd.DatetimeIndex(calendar).normalize().sort_values()
-    if calendar.isna().any() or calendar.has_duplicates or list(calendar) != list(p["date"]):
-        return _block("交易日历与价格序列不一致")
-    tradable = p["tradable"].map({True: True, False: False, 1: True, 0: False, "true": True, "false": False, "True": True, "False": False})
-    if tradable.isna().any():
-        return _block("缺少可成交状态")
-    p["tradable"] = tradable.astype(bool)
-    for col in ("actual_open", "total_return_open"):
-        p[col] = pd.to_numeric(p[col], errors="coerce")
-    if (p["total_return_open"].isna() | ~np.isfinite(p["total_return_open"]) | p["total_return_open"].le(0)).any() or (
-        p["tradable"] & (p["actual_open"].isna() | ~np.isfinite(p["actual_open"]) | p["actual_open"].le(0))
-    ).any():
-        return _block("价格缺失，不能用零收益或其他日期代替")
     s = signals.copy()
     s["target_equity"] = pd.to_numeric(s["target_equity"], errors="coerce")
     if not s.empty:
@@ -284,4 +298,82 @@ def evaluate_allocation(
                         "matched_exposure": "全期规则平均股票暴露的事后固定比例，仅用于描述性对照",
                         "terminal_liquidation": False, "volatility_annualization_days": 252},
         "evidence": dict(evidence), "limitations": list(_OMISSIONS),
+    }
+
+
+def evaluate_warning_windows(
+    prices: pd.DataFrame, warnings: pd.DataFrame, evidence: dict[str, Any], *,
+    trading_dates: Iterable[Any] | None, horizons: tuple[int, ...] = (20, 60),
+) -> dict[str, Any]:
+    """Measure non-overlapping warning windows on observed tradable opens.
+
+    Window selection does not establish statistical independence or a forecast
+    threshold; false positives and missed risks require a separate protocol.
+    """
+    error = _evidence_error(evidence)
+    if error:
+        return _block(error)
+    if not evidence.get("warning_vintage_evidence"):
+        return _block("缺少预警信号当时可得版本的证明")
+    p, error = _prepare_prices(prices, trading_dates)
+    if error:
+        return _block(error)
+    if not isinstance(warnings, pd.DataFrame) or not {"signal_at", "available_at", "warning"}.issubset(warnings.columns):
+        return _block("预警需提供生成时间、可得时间和是否触发")
+    if not horizons or any(not isinstance(h, int) or h <= 0 for h in horizons) or len(set(horizons)) != len(horizons):
+        return _block("预警观察间隔必须是不同的正整数")
+
+    w = warnings.copy()
+    known = w["warning"].notna()
+    active = w["warning"].map({True: True, False: False, 1: True, 0: False,
+                               "true": True, "false": False, "True": True, "False": False})
+    if (known & active.isna()).any():
+        return _block("预警状态须为真、假或未知")
+    w["signal_at"] = w["signal_at"].map(_time)
+    w["available_at"] = w["available_at"].map(_time)
+    if w["signal_at"].isna().any() or (known & (w["available_at"].isna() | (w["available_at"] > w["signal_at"]))).any():
+        return _block("预警生成时刻或数据可得时刻不完整，或使用了未来数据")
+    w["warning"] = active
+    w = w.sort_values("signal_at", kind="stable").reset_index(drop=True)
+    triggered = w.loc[w["warning"] == True]
+    unknown_count = int((~known).sum())
+    openings = p["date"] + pd.Timedelta(hours=9, minutes=30)
+    result: dict[str, Any] = {}
+    incomplete = False
+    for horizon in horizons:
+        events = []
+        overlapping_count = incomplete_count = 0
+        previous_end = -1
+        for signal in triggered.itertuples(index=False):
+            if signal.signal_at.normalize() < p.at[0, "date"]:
+                incomplete_count += 1
+                continue
+            candidates = p.index[p["tradable"] & (openings > signal.signal_at)]
+            if candidates.empty:
+                incomplete_count += 1
+                continue
+            entry = int(candidates[0])
+            if entry <= previous_end:
+                overlapping_count += 1
+                continue
+            end = entry + horizon
+            previous_end = end
+            if end >= len(p) or not p.at[end, "tradable"]:
+                incomplete_count += 1
+                continue
+            path = p.loc[entry:end]
+            observed = path.loc[path["tradable"], "total_return_open"].to_numpy(dtype=float)
+            drawdown = observed / np.maximum.accumulate(observed) - 1.0
+            events.append({"signal_at": str(signal.signal_at), "entry_date": p.at[entry, "date"].date().isoformat(),
+                           "end_date": p.at[end, "date"].date().isoformat(),
+                           "forward_return": float(observed[-1] / observed[0] - 1.0),
+                           "max_drawdown": float(drawdown.min())})
+        incomplete |= incomplete_count > 0
+        result[str(horizon)] = {"warning_count": len(triggered), "overlapping_count": overlapping_count,
+                                "incomplete_count": incomplete_count, "events": events}
+    return {
+        "status": "DATA_PARTIAL" if unknown_count or incomplete else "OK",
+        "validation_status": "not_validated", "unknown_count": unknown_count, "horizons": result,
+        "note": "每个间隔按触发时间保留不重叠窗口，不保证统计独立；仅用可成交开盘价观察，"
+                "不含盘中波动；价格及历史版本证据由调用方提供，不能由此推断漏报或预警有效性。",
     }
