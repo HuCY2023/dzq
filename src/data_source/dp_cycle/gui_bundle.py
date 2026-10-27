@@ -240,12 +240,14 @@ def load_dp_cycle_gui_bundle(
     from output_paths import dp_cycle_store_dir
     from data_source.dp_cycle.etf_flow import load_latest_etf_flow_snapshot
     from data_source.dp_cycle.holder_disclosures import load_holder_disclosures
+    from data_source.dp_cycle.turnover_observation import load_latest_turnover_snapshot
     from data_source.dp_cycle.margin import _margin_local_timestamp
 
     etf_flow = load_latest_etf_flow_snapshot(
         Path(dp_cycle_store_dir()) / "etf_flow_imports", as_of=_margin_local_timestamp(meta["as_of"]),
     )
     etf_holder_disclosures = load_holder_disclosures(as_of=meta["as_of"])
+    turnover_observation = load_latest_turnover_snapshot(Path(dp_cycle_store_dir()) / "turnover_imports", as_of=meta["as_of"])
 
     # 流动性节点监控数据（按需获取，不阻塞主流程）
     # 在 _switch_view("liquidity") 时单独获取
@@ -263,6 +265,7 @@ def load_dp_cycle_gui_bundle(
         "etf_hist_adjusted": etf_hist_adjusted,
         "etf_flow": etf_flow,
         "etf_holder_disclosures": etf_holder_disclosures,
+        "turnover_observation": turnover_observation,
         "trade_calendar": trade_calendar,
         "margin": tables.get("margin", pd.DataFrame()),
         "growth_value": tables.get("growth_value", pd.DataFrame()),
@@ -297,6 +300,13 @@ def _clip_bundle_as_of(bundle: dict[str, Any], as_of: date | str) -> dict[str, A
         from data_source.dp_cycle.holder_disclosures import load_holder_disclosures
 
         clipped["etf_holder_disclosures"] = load_holder_disclosures(as_of=cutoff)
+    turnover = clipped.get("turnover_observation")
+    if isinstance(turnover, dict) and turnover.get("date"):
+        observed = _margin_local_timestamp(turnover["date"]).normalize()
+        generated = _margin_local_timestamp(turnover.get("source_generated_at")).normalize()
+        if observed > cutoff or generated > cutoff:
+            clipped["turnover_observation"] = {"status": "unavailable", "date": None,
+                                               "reason": "该本地快照在所选日期尚不可用。"}
     flow = clipped.get("etf_flow")
     if isinstance(flow, dict) and flow.get("date"):
         flow_date = _margin_local_timestamp(flow["date"])
@@ -469,6 +479,18 @@ def _other_dependency_mtimes() -> dict[str, int]:
                 result[f"etf_flow/{metadata.parent.name}/{name}"] = (metadata.parent / name).stat().st_mtime_ns
             except OSError:
                 result[f"etf_flow/{metadata.parent.name}/{name}"] = 0
+    turnover_root = Path(dp_cycle_store_dir()) / "turnover_imports"
+    try:
+        observation = max(turnover_root.glob("*/observation.json"),
+                          key=lambda path: (path.stat().st_mtime_ns, str(path)), default=None)
+    except OSError:
+        observation = None
+    if observation is not None:
+        for name in ("observation.json", "source_summary.json", "latest-top5.csv"):
+            try:
+                result[f"turnover/{observation.parent.name}/{name}"] = (observation.parent / name).stat().st_mtime_ns
+            except OSError:
+                result[f"turnover/{observation.parent.name}/{name}"] = 0
     return result
 
 
@@ -878,6 +900,7 @@ def bundle_to_web_payload(
         "etf": etf_rows,
         "etf_flow": bundle.get("etf_flow"),
         "etf_holder_disclosures": bundle.get("etf_holder_disclosures"),
+        "turnover_observation": bundle.get("turnover_observation"),
         "margin": margin_rows,
         "growth_value": gv_rows,
         "high_low": hl_rows,

@@ -268,7 +268,7 @@ def _position_page(pdf: PdfPages, *, as_of: str, diagnosis: dict[str, Any], page
 
 
 def _method_page(pdf: PdfPages, *, as_of: str, page: int, total: int, rule_version: str = "improved_v1",
-                 holder_note: str = "") -> None:
+                 holder_note: str = "", turnover_note: str = "") -> None:
     fig = plt.figure(figsize=PAGE)
     ax = fig.add_axes([0.06, 0.08, 0.88, 0.86])
     ax.axis("off")
@@ -296,6 +296,8 @@ def _method_page(pdf: PdfPages, *, as_of: str, page: int, total: int, rule_versi
     ]
     if holder_note:
         lines.insert(2, holder_note)
+    if turnover_note:
+        lines.insert(3, turnover_note)
     y = 0.92
     for line in lines:
         ax.text(0.0, y, line, fontsize=9, color="#333", transform=ax.transAxes, va="top")
@@ -429,9 +431,14 @@ def build_long_term_pdf(
                 page=i,
                 total=total,
             )
+        turnover = tables.get("turnover_observation") or {}
+        turnover_note = ""
+        if turnover.get("date"):
+            turnover_note = (f"本地成交 {turnover['date']}：{turnover['stocks']} 只，前5%占 "
+                             f"{turnover['shares_pct']['5']:.2f}%，{turnover['top5_amount_yi']:.2f} 亿元；部分覆盖，仅观察。")
         _method_page(pdf, as_of=str(as_of), page=total, total=total,
                      rule_version=diagnosis.get("rule_version") or "improved_v1",
-                     holder_note=(tables.get("etf_holder_disclosures") or {}).get("pdf_note", ""))
+                     holder_note=(tables.get("etf_holder_disclosures") or {}).get("pdf_note", ""), turnover_note=turnover_note)
 
     if latest_copy:
         os.makedirs(os.path.dirname(latest_copy) or ".", exist_ok=True)
