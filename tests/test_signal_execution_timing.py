@@ -185,8 +185,11 @@ class ExecutionTimingTests(unittest.TestCase):
         result = evaluate()
         self.assertEqual(result["validation_status"], "not_validated")
         self.assertEqual(result["period"]["end_at"], "2024-01-05 09:30:00")
-        self.assertEqual(set(result["strategies"]), {"rule", "buy_hold", "fixed_50"})
+        self.assertEqual(set(result["strategies"]), {"rule", "buy_hold", "fixed_50", "trend_20", "volatility_20", "matched_exposure"})
         for strategy in result["strategies"].values():
+            if strategy.get("status") == "unavailable":
+                self.assertNotIn("metrics", strategy)
+                continue
             self.assertEqual([row["date"] for row in strategy["daily"]], prices()["date"].tolist())
             self.assertIn("max_drawdown", strategy["metrics"])
             self.assertIn("turnover", strategy["metrics"])
@@ -241,7 +244,8 @@ class ExecutionTimingTests(unittest.TestCase):
             (root / "evidence.json").write_text(json.dumps(evidence()), encoding="utf-8")
             args = [sys.executable, str(script), "--prices", str(root / "prices.csv"),
                     "--signals", str(root / "signals.csv"), "--calendar", str(root / "calendar.csv"),
-                    "--evidence", str(root / "evidence.json"), "--output", str(root / "runs")]
+                    "--evidence", str(root / "evidence.json"), "--output", str(root / "runs"),
+                    "--one-way-cost", "0.001"]
             for _ in range(2):
                 result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -249,6 +253,7 @@ class ExecutionTimingTests(unittest.TestCase):
             self.assertEqual(len(runs), 2)
             stored = json.loads(runs[0].read_text(encoding="utf-8"))
             self.assertEqual(stored["status"], "OK")
+            self.assertEqual(stored["assumptions"]["one_way_cost"], 0.001)
 
 
 if __name__ == "__main__":
