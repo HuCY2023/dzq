@@ -1312,6 +1312,20 @@
         holderText.appendChild(row);
       });
     }
+    const turnoverText = el("turnoverText");
+    if (turnoverText) {
+      const turnover = data.turnover_observation || {};
+      if (!turnover.date) {
+        turnoverText.textContent = turnover.reason || "尚未导入本地成交集中度快照。";
+      } else {
+        const share = turnover.shares_pct || {};
+        turnoverText.textContent = turnover.date + " · 本地有效成交 " + turnover.stocks +
+          " 只 · 前1%/3%/5%成交占比 " + ["1", "3", "5"].map((p) => Number(share[p]).toFixed(2) + "%").join(" / ") +
+          " · 前5% " + turnover.top_counts["5"] + " 只合计 " + Number(turnover.top5_amount_yi).toFixed(2) + " 亿元" +
+          "；源报告请求截止 " + turnover.source_requested_as_of + "，生成于 " +
+          (turnover.source_generated_at || "未知").replace("T", " ") + "。" + turnover.note;
+      }
+    }
     try { renderQuality(data); } catch (e) { console.warn("renderQuality", e); }
     try { renderDiagnosis(data); } catch (e) { console.warn("renderDiagnosis", e); }
 
