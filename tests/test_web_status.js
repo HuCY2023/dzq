@@ -29,8 +29,10 @@ vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../web/dp_cycle/app.js"
   setTimeout: () => 1, clearTimeout() {}, console,
 });
 
-window.renderDpCycle({ etf_holder_disclosures: {coverage: {verified_reports: 1, expected: 4},
-  display: "已核验基金报告 1/4 只。159919 报告期 2026-06-30，公告 2026-08-31，未披露实名持有人。最近实名快照为 2025-12-31，不能作为当前持仓。", items: [
+window.renderDpCycle({ etf_holder_disclosures: {coverage: {verified_reports: 4, expected: 4},
+  display: "已核验基金报告 4/4 只；未披露不等于零，历史快照不能作为当前持仓。", items: [
+  {code: "510300", status: "not_disclosed", period_end: "2026-06-30", published_date: "2026-08-29",
+   source_url: "https://example.com/current.pdf", last_named: {period_end: "2025-12-31", direct_shares: 73513073833, source_url: "https://example.com/prior.pdf"}},
   {code: "159919", status: "not_disclosed", period_end: "2026-06-30", published_date: "2026-08-31",
    source_url: "https://static.cninfo.com.cn/example.pdf", last_named: {period_end: "2025-12-31", direct_shares: 35498494985}}]},
   etf_flow: {status: "partial", date: "2026-10-26", flow_yi: 217.1622, source: {events_recorded: false},
@@ -69,8 +71,11 @@ assert.match(elements.etfFlowText.textContent, /截至日覆盖未知/);
 assert.match(elements.etfFlowText.textContent, /估算.*非.*现金流/);
 assert.match(elements.etfFlowText.textContent, /事件表.*未留存/);
 assert.match(elements.etfFlowText.textContent, /手动.*导入/);
-assert.match(elements.etfHolderText.textContent, /1\/4.*159919.*2026-06-30.*2026-08-31.*未披露.*实名/);
-assert.match(elements.etfHolderText.textContent, /2025-12-31.*不能.*当前/);
+assert.match(elements.etfHolderText.textContent, /4\/4.*不能.*当前/);
+assert.match(elements.etfHolderText.children[0].textContent, /510300.*2026-06-30.*2026-08-29.*未列实名.*2025-12-31.*735\.13.*历史/);
+assert.equal(elements.etfHolderText.children[0].children[0].href, "https://example.com/current.pdf");
+assert.equal(elements.etfHolderText.children[0].children[1].href, "https://example.com/prior.pdf");
+assert.match(elements.etfHolderText.children[1].textContent, /159919.*2026-08-31.*354\.98.*历史/);
 assert.match(elements.redLightGrid.children[0].innerHTML, />未知</);
 assert.match(elements.redLightGrid.children[1].innerHTML, />灭</);
 assert.match(elements.redLightHint.textContent, /已知 1\/4/);
