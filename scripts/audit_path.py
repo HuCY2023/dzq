@@ -16,8 +16,8 @@ from data_source.dp_cycle.diagnosis import (
     diagnose_position,
     score_margin_regime,
     score_national_team_regime,
-    _as_pct,
 )
+from data_source.dp_cycle.margin import causal_margin_frame
 from data_source.dp_cycle.rules import NT_SHORT_WINDOW
 
 
@@ -113,15 +113,18 @@ def main() -> int:
 
     pct, t = None, None
     margin = b.get("margin")
-    m = margin.dropna(subset=["融资余额_亿元"]) if isinstance(margin, pd.DataFrame) and "融资余额_亿元" in margin.columns else pd.DataFrame()
-    if len(m) >= 21 and "分位_全样本" in m.columns and pd.notna(m["分位_全样本"].iloc[-1]):
+    m = causal_margin_frame(margin, as_of=(b.get("meta") or {}).get("as_of"),
+                            trade_calendar=b.get("trade_calendar"))
+    if not m.empty and pd.notna(m["融资余额_亿元"].iloc[-1]) and pd.notna(m["融资_20交易日变化_亿元"].iloc[-1]):
         last = m.iloc[-1]
-        prev = m.iloc[-21]
-        delta = float(last["融资余额_亿元"] - prev["融资余额_亿元"])
-        pct = _as_pct(float(last["分位_全样本"]))
+        values = m["融资余额_亿元"].dropna()
+        balance = float(last["融资余额_亿元"])
+        pct = float(((values < balance).sum() + ((values == balance).sum() + 1) / 2) / len(values) * 100)
+        delta = float(last["融资_20交易日变化_亿元"])
         sc, z, t, _tag = score_margin_regime(pct, delta)
-        print(f"Margin recalc: bal={last['融资余额_亿元']:.0f} pct={pct:.1f} delta21={delta:+.0f} -> {sc} {z} {t}")
-        if mg.get("status") == "ok" and (sc != mg["score"] or z != mg.get("zone")):
+        print(f"Margin recalc: bal={balance:.0f} pct={pct:.1f} delta20={delta:+.0f} -> {sc} {z} {t}")
+        if mg.get("status") == "ok" and (sc != mg["score"] or z != mg.get("zone")
+                                         or abs(pct - mg["pct"]) > 1e-8 or abs(delta - mg["delta_20"]) > 1e-8):
             issues.append(f"FAIL: Margin mismatch {mg['score']}/{mg.get('zone')} vs {sc}/{z}")
     else:
         print("Margin recalc: 数据不足")
