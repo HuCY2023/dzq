@@ -369,14 +369,106 @@ def fetch_margin_daily(*, cross_check: bool = True) -> tuple[pd.DataFrame, dict[
     return out.reset_index(drop=True) if len(out) else out, meta
 
 
+def _margin_local_timestamp(value: Any) -> pd.Timestamp:
+    """将带时区时间转为台北本地时间；无时区时间本身就是本地时间。"""
+    stamp = pd.Timestamp(value)
+    if pd.notna(stamp) and stamp.tzinfo is not None:
+        stamp = stamp.tz_convert("Asia/Taipei").tz_localize(None)
+    return stamp
+
+
+def _margin_local_timestamps(values: pd.Series) -> pd.Series:
+    """按本地时间比较可混合日期、时间及带时区的发布时间。"""
+    if isinstance(values.dtype, pd.DatetimeTZDtype):
+        return values.dt.tz_convert("Asia/Taipei").dt.tz_localize(None)
+    if pd.api.types.is_datetime64_any_dtype(values.dtype):
+        return values
+
+    def convert(value: Any) -> pd.Timestamp:
+        try:
+            return _margin_local_timestamp(value)
+        except (TypeError, ValueError, OverflowError):
+            return pd.NaT
+
+    return pd.to_datetime(values.map(convert), errors="coerce")
+
+
+def causal_margin_frame(
+    df: pd.DataFrame | None, *, as_of: Any | None = None, trade_calendar: dict[str, Any] | None = None
+) -> pd.DataFrame:
+    """按当期可见余额计算展开分位及 20 个交易日或观测日间隔的变化。"""
+    if df is None or df.empty or not {"date", "融资余额_亿元"}.issubset(df.columns):
+        return pd.DataFrame()
+    x = df.copy()
+    x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.normalize()
+    x["融资余额_亿元"] = pd.to_numeric(x["融资余额_亿元"], errors="coerce")
+    x = x.dropna(subset=["date"])
+    if "available_at" in x.columns:
+        x["available_at"] = _margin_local_timestamps(x["available_at"])
+    if as_of is not None:
+        cutoff = _margin_local_timestamp(as_of)
+        x = x.loc[x["date"] <= cutoff.normalize()]
+        if "available_at" in x.columns:
+            released = x["available_at"]
+            missing = x["融资余额_亿元"].isna()
+            x = x.loc[(released <= cutoff) | (released.isna() & missing)]
+    if "available_at" in x.columns:
+        x = x.sort_values("available_at", kind="stable", na_position="first")
+    x = x.sort_values("date", kind="stable").drop_duplicates("date", keep="last").reset_index(drop=True)
+    calendar_verified = pd.Series(False, index=x.index)
+    observed_delta = x["融资余额_亿元"] - x["融资余额_亿元"].shift(20)
+    delta = observed_delta.copy()
+    if not x.empty and isinstance(trade_calendar, dict):
+        start = pd.to_datetime(trade_calendar.get("coverage_start"), errors="coerce")
+        end = pd.to_datetime(trade_calendar.get("coverage_end"), errors="coerce")
+        if pd.notna(start) and pd.notna(end):
+            days = pd.DatetimeIndex(pd.to_datetime(trade_calendar.get("dates", []), errors="coerce")).dropna().normalize()
+            days = days[(days >= start) & (days <= end)].sort_values().unique()
+            positions = days.get_indexer(pd.DatetimeIndex(x["date"]))
+            calendar_verified = pd.Series(positions >= 20, index=x.index)
+            if calendar_verified.any():
+                prior_dates = days.take(positions[calendar_verified.to_numpy()] - 20)
+                prior = x.set_index("date")["融资余额_亿元"].reindex(prior_dates).to_numpy()
+                delta.loc[calendar_verified] = x.loc[calendar_verified, "融资余额_亿元"].to_numpy() - prior
+    balances = x["融资余额_亿元"]
+    x["融资_截至当期分位"] = balances.expanding(min_periods=1).rank(pct=True) * 100.0
+    x["融资_20交易日变化_亿元"] = delta
+    x["融资_有效样本数"] = balances.notna().cumsum()
+    x["融资_交易日历已核验"] = calendar_verified
+    return x
+
+
+def margin_signal_from_row(row: pd.Series | None) -> dict[str, Any]:
+    """用一个已计算的当期融资观测形成与展示层共用的信号。"""
+    if row is None:
+        return {"status": "gap", "reason": "无融资余额"}
+    if pd.isna(row["融资余额_亿元"]):
+        return {"status": "partial", "reason": f"{pd.Timestamp(row['date']).date()} 融资余额缺失"}
+    if row["融资_有效样本数"] < 25 or pd.isna(row["融资_20交易日变化_亿元"]):
+        return {"status": "gap", "reason": "融资余额样本不足或 20 个交易日间隔缺失"}
+    from data_source.dp_cycle.rules import score_margin_regime
+
+    pct = float(row["融资_截至当期分位"])
+    delta = float(row["融资_20交易日变化_亿元"])
+    score, zone, trend, tag = score_margin_regime(pct, delta)
+    return {"status": "ok", "date": pd.Timestamp(row["date"]), "balance": float(row["融资余额_亿元"]),
+            "pct": pct, "delta": delta, "score": score, "zone": zone, "trend": trend, "tag": tag,
+            "calendar_verified": bool(row["融资_交易日历已核验"])}
+
+
+def margin_signal_at(
+    df: pd.DataFrame | None, *, as_of: Any | None = None, trade_calendar: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    x = causal_margin_frame(df, as_of=as_of, trade_calendar=trade_calendar)
+    return margin_signal_from_row(x.iloc[-1] if not x.empty else None)
+
+
 def enrich_margin(df: pd.DataFrame, *, lookback_years: int = 5) -> pd.DataFrame:
-    """月末值月变化、全样本分位、近 N 年分位。"""
+    """月末值月变化、截至当期的展开分位、近 N 年分位。"""
     if df.empty:
         return df
-    x = df.copy()
-    x["date"] = pd.to_datetime(x["date"])
-    x = x.sort_values("date").reset_index(drop=True)
-    x["分位_全样本"] = x["融资余额_亿元"].rank(pct=True) * 100.0
+    x = causal_margin_frame(df)
+    x["分位_全样本"] = x["融资_截至当期分位"]
 
     # ── 性能优化：numpy searchsorted 替代 iterrows + .loc[] 切片 ──
     import numpy as np

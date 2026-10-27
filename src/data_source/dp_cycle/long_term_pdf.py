@@ -267,21 +267,24 @@ def _position_page(pdf: PdfPages, *, as_of: str, diagnosis: dict[str, Any], page
     _page(fig, pdf)
 
 
-def _method_page(pdf: PdfPages, *, as_of: str, page: int, total: int) -> None:
+def _method_page(pdf: PdfPages, *, as_of: str, page: int, total: int, rule_version: str = "improved_v1") -> None:
     fig = plt.figure(figsize=PAGE)
     ax = fig.add_axes([0.06, 0.08, 0.88, 0.86])
     ax.axis("off")
     ax.set_title("口径 · 数据源 · 使用说明", fontsize=16, loc="left", color="#0f2744", pad=10)
 
+    author = rule_version == "author_v1"
     lines = [
         "视频口径：资金侧边际变差共振 → 打分 → 散户五档决策。日常 ±1/±2；多项同负才极端（如 −9）。",
         "A 资金三件套：主力（只作风控）· 宽基ETF份额代理（不可识别持有人）· 融资分位×方向。",
         "B 行为：成长–价值偏离≈17；高低比热~10:1 / 空~1:10。本机广度默认乐咕120日，≠作者52周。",
         "C 解禁：提前约一年；高峰后 2–3 月主力易偏高。",
-        "D −9 扩展：剪刀差 / 公募新发腰斩 / 减持+75% / 科技流出银行不接（有数才进分）。",
+        ("D 扩展：剪刀差可计分；公募、减持、行业项按数据覆盖判断。" if author else
+         "D 扩展：剪刀差仅观察；公募、减持、行业项按数据覆盖判断。"),
         "E 旁证：A股成交拥挤度、科创IV、美股保证金/M2（默认不进合计分）。",
         "红灯四件套：偏离极值 + 高低比背离 + 高杠杆 + 外盘脆弱；扳机仍是资金边际。",
-        "决策：关键数据不足不输出仓位；ETF份额代理不独立决定仓位。未参与评分项不当作0。",
+        ("决策：关键数据不足不输出仓位；作者版允许ETF份额代理参与仓位。" if author else
+         "决策：关键数据不足不输出仓位；ETF份额代理不独立决定仓位。"),
         "权威：research/DP/大周期/框架.md · 散户决策_推演核查.md",
         "",
         "更新报告：双击 update-local.cmd，或运行 scripts/build_web_report.py --refresh --pdf。",
@@ -343,6 +346,14 @@ def build_long_term_pdf(
     etf_sub = "≠汇金/证金身份"
     if etf_coverage.get("current_count") is not None:
         etf_sub = f"覆盖 {etf_coverage['current_count']}/{etf_coverage.get('expected_count', '?')} 只 · " + etf_sub
+    etf_flow = tables.get("etf_flow") or {}
+    flow_coverage = etf_flow.get("coverage") or {}
+    if etf_flow.get("date") and etf_flow.get("flow_yi") is not None:
+        etf_sum = f"{float(etf_flow['flow_yi']):+.2f} 亿（估算）"
+        etf_sub = (f"{etf_flow['date']} · {flow_coverage.get('comparable', 0)}/"
+                   f"{flow_coverage.get('expected', 4)}只 · 非实际现金流")
+        if (etf_flow.get("source") or {}).get("events_recorded") is False:
+            etf_sub += " · 事件表未留存"
     cards = [
         {
             "title": "01 主力资金",
@@ -359,7 +370,7 @@ def build_long_term_pdf(
         {
             "title": "03 融资余额",
             "value": f"{_fmt_num(mg.get('last_融资余额_亿元'), 0)} 亿",
-            "sub": "融资余额 · 全样本分位参与规则",
+            "sub": "融资余额 · 截至当期历史分位",
             "color": "#0f2744",
         },
         {
@@ -415,7 +426,8 @@ def build_long_term_pdf(
                 page=i,
                 total=total,
             )
-        _method_page(pdf, as_of=str(as_of), page=total, total=total)
+        _method_page(pdf, as_of=str(as_of), page=total, total=total,
+                     rule_version=diagnosis.get("rule_version") or "improved_v1")
 
     if latest_copy:
         os.makedirs(os.path.dirname(latest_copy) or ".", exist_ok=True)

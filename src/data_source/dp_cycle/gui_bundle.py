@@ -12,7 +12,8 @@ import pandas as pd
 from data_source.dp_cycle.store import HISTORY_START_STR, load_from_db, table_counts
 
 DEFAULT_WEEKLY_INDEX = "sh000001"
-PAYLOAD_CACHE_VERSION = 2
+DEFAULT_RULE_VERSION = "improved_v1"
+PAYLOAD_CACHE_VERSION = 3
 INDEX_CHOICES = {
     "上证指数": "sh000001",
     "沪深300": "sh000300",
@@ -235,6 +236,15 @@ def load_dp_cycle_gui_bundle(
     except Exception as exc:
         meta["us_crowding"] = {"ok": False, "error": str(exc)}
 
+    from pathlib import Path
+    from output_paths import dp_cycle_store_dir
+    from data_source.dp_cycle.etf_flow import load_latest_etf_flow_snapshot
+    from data_source.dp_cycle.margin import _margin_local_timestamp
+
+    etf_flow = load_latest_etf_flow_snapshot(
+        Path(dp_cycle_store_dir()) / "etf_flow_imports", as_of=_margin_local_timestamp(meta["as_of"]),
+    )
+
     # 流动性节点监控数据（按需获取，不阻塞主流程）
     # 在 _switch_view("liquidity") 时单独获取
     liquidity: dict[str, Any] | None = None
@@ -249,6 +259,7 @@ def load_dp_cycle_gui_bundle(
         "etf_monthly": etf_m,
         "etf_hist": etf_hist,
         "etf_hist_adjusted": etf_hist_adjusted,
+        "etf_flow": etf_flow,
         "trade_calendar": trade_calendar,
         "margin": tables.get("margin", pd.DataFrame()),
         "growth_value": tables.get("growth_value", pd.DataFrame()),
@@ -274,8 +285,22 @@ def _date_str(v: Any) -> str | None:
 
 def _clip_bundle_as_of(bundle: dict[str, Any], as_of: date | str) -> dict[str, Any]:
     """按观察日截断图表输入；解禁计划只在可证明已公布时用于历史视角。"""
-    cutoff = pd.Timestamp(as_of).normalize()
+    from data_source.dp_cycle.margin import _margin_local_timestamp, _margin_local_timestamps
+
+    cutoff = _margin_local_timestamp(as_of).normalize()
     clipped = dict(bundle)
+    flow = clipped.get("etf_flow")
+    if isinstance(flow, dict) and flow.get("date"):
+        flow_date = _margin_local_timestamp(flow["date"])
+        flow_as_of = _margin_local_timestamp(flow.get("as_of")) if flow.get("as_of") else pd.NaT
+        if ((pd.notna(flow_date) and flow_date.normalize() > cutoff)
+                or (pd.notna(flow_as_of) and flow_as_of.normalize() > cutoff)):
+            clipped["etf_flow"] = {**flow, "status": "unavailable", "date": None,
+                                   "latest_observation_date": None, "components": [], "flow_yi": None,
+                                   "as_of": cutoff.date().isoformat(),
+                                   "coverage": {"observed": 0, "comparable": 0,
+                                                "expected": 4, "complete": False},
+                                   "reason": "该快照的观察或状态晚于分析日期，无法用于此时点。"}
     for key in (
         "weekly", "main_force_daily", "main_force_weekly", "main_force_monthly",
         "northbound_daily", "etf_daily", "etf_hist", "etf_hist_adjusted", "etf_monthly",
@@ -286,8 +311,12 @@ def _clip_bundle_as_of(bundle: dict[str, Any], as_of: date | str) -> dict[str, A
             dates = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
             visible = dates <= cutoff
             if "available_at" in frame.columns:
-                released = pd.to_datetime(frame["available_at"], errors="coerce")
+                released = (_margin_local_timestamps(frame["available_at"]) if key == "margin"
+                            else pd.to_datetime(frame["available_at"], errors="coerce"))
                 available = released <= cutoff
+                if key == "margin" and "融资余额_亿元" in frame.columns:
+                    missing = pd.to_numeric(frame["融资余额_亿元"], errors="coerce").isna()
+                    available |= released.isna() & missing
                 if key == "weekly":
                     from data_source.dp_cycle.diagnosis import _calendar_week
 
@@ -405,6 +434,35 @@ def _us_snapshot_mtime_ns() -> int:
         return 0
 
 
+def _other_dependency_mtimes() -> dict[str, int]:
+    from pathlib import Path
+    from output_paths import dp_cycle_store_dir
+
+    paths = {
+        "trade_calendar": Path(dp_cycle_store_dir()) / "trade_calendar.csv",
+        "etf_events": Path(__file__).resolve().parents[3] / "research" / "DP" / "data" / "etf_share_events.csv",
+    }
+    result: dict[str, int] = {}
+    for name, path in paths.items():
+        try:
+            result[name] = path.stat().st_mtime_ns
+        except OSError:
+            result[name] = 0
+    flow_root = Path(dp_cycle_store_dir()) / "etf_flow_imports"
+    try:
+        metadata = max(flow_root.glob("*/metadata.json"),
+                       key=lambda path: (path.stat().st_mtime_ns, str(path)), default=None)
+    except OSError:
+        metadata = None
+    if metadata is not None:
+        for name in ("metadata.json", "daily.csv", "components.csv", "trade_calendar_source.csv", "etf_share_events.csv"):
+            try:
+                result[f"etf_flow/{metadata.parent.name}/{name}"] = (metadata.parent / name).stat().st_mtime_ns
+            except OSError:
+                result[f"etf_flow/{metadata.parent.name}/{name}"] = 0
+    return result
+
+
 def _payload_cache_path(index_symbol: str) -> "Path":
     from pathlib import Path
 
@@ -415,7 +473,7 @@ def _payload_cache_path(index_symbol: str) -> "Path":
 
 
 def load_cached_web_payload(
-    index_symbol: str, *, require_heavy: bool = False
+    index_symbol: str, *, require_heavy: bool = False, rule_version: str = DEFAULT_RULE_VERSION,
 ) -> dict[str, Any] | None:
     """读 GUI 网页载荷缓存；依赖变化或跨日时重新计算。"""
     import json
@@ -430,11 +488,15 @@ def load_cached_web_payload(
         envelope = raw.get("_cache") or {}
         if envelope.get("version") != PAYLOAD_CACHE_VERSION:
             return None
+        if envelope.get("rule_version") != rule_version:
+            return None
         if str(envelope.get("saved_at") or "")[:10] != date.today().isoformat():
             return None
         if int(envelope.get("db_mtime_ns") or -1) != _db_mtime_ns():
             return None
         if envelope.get("us_snapshot_mtime_ns") != _us_snapshot_mtime_ns():
+            return None
+        if envelope.get("other_dependency_mtimes") != _other_dependency_mtimes():
             return None
         if str(envelope.get("index_symbol") or "") != str(index_symbol):
             return None
@@ -464,8 +526,10 @@ def save_web_payload_cache(
             "_cache": {
                 "index_symbol": index_symbol,
                 "version": PAYLOAD_CACHE_VERSION,
+                "rule_version": (payload.get("diagnosis") or {}).get("rule_version", DEFAULT_RULE_VERSION),
                 "db_mtime_ns": _db_mtime_ns(),
                 "us_snapshot_mtime_ns": _us_snapshot_mtime_ns(),
+                "other_dependency_mtimes": _other_dependency_mtimes(),
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
                 "heavy": bool((payload.get("diagnosis") or {}).get("heavy", True)),
             },
@@ -505,12 +569,13 @@ def load_gui_web_result(
     heavy: bool | None = None,
     board_max_days: int = 10,
     progress_cb: Any | None = None,
+    rule_version: str = DEFAULT_RULE_VERSION,
 ) -> dict[str, Any]:
     """GUI 一站式：优先磁盘缓存 → 读库组装。refresh 时强制重算并写缓存。"""
     if heavy is None:
         heavy = bool(refresh)
     if not refresh:
-        cached = load_cached_web_payload(index_symbol, require_heavy=bool(heavy))
+        cached = load_cached_web_payload(index_symbol, require_heavy=bool(heavy), rule_version=rule_version)
         if cached is not None:
             return cached
 
@@ -533,7 +598,7 @@ def load_gui_web_result(
         progress_cb=progress_cb,
     )
     _p("组装网页载荷…", 0, 1)
-    payload = bundle_to_web_payload(bundle, index_label=label, heavy=heavy)
+    payload = bundle_to_web_payload(bundle, index_label=label, heavy=heavy, rule_version=rule_version)
     meta = bundle.get("meta") or {}
     # 入库后库 mtime 已变；读库结果写缓存，下次打开秒开
     save_web_payload_cache(str(meta.get("index_symbol") or index_symbol), payload, meta)
@@ -542,7 +607,8 @@ def load_gui_web_result(
 
 
 def bundle_to_web_payload(
-    bundle: dict[str, Any], *, index_label: str = "", heavy: bool = True
+    bundle: dict[str, Any], *, index_label: str = "", heavy: bool = True,
+    rule_version: str = DEFAULT_RULE_VERSION,
 ) -> dict[str, Any]:
     """网页载荷：五项一律周频，与顶图周线同一时间网格，避免日频/稀疏点对不齐。"""
     as_of = (bundle.get("meta") or {}).get("as_of")
@@ -552,7 +618,9 @@ def bundle_to_web_payload(
     anchor = _weekly_anchor_dates(weekly)
     incomplete_anchor = None
     if as_of and len(anchor):
-        cutoff = pd.Timestamp(as_of).normalize()
+        from data_source.dp_cycle.margin import _margin_local_timestamp
+
+        cutoff = _margin_local_timestamp(as_of).normalize()
         if cutoff.weekday() < 4:
             friday = cutoff + pd.Timedelta(days=4 - cutoff.weekday())
             for key in ("main_force_daily", "margin", "growth_value", "high_low", "etf_daily"):
@@ -786,7 +854,7 @@ def bundle_to_web_payload(
 
     from data_source.dp_cycle.diagnosis import diagnose_position
 
-    diagnosis = diagnose_position(bundle, heavy=heavy, as_of=meta.get("as_of"))
+    diagnosis = diagnose_position(bundle, heavy=heavy, as_of=meta.get("as_of"), rule_version=rule_version)
 
     return {
         "subtitle": subtitle,
@@ -799,6 +867,7 @@ def bundle_to_web_payload(
         "author_month_line": -4000.0,
         "author_week_line": -2000.0,
         "etf": etf_rows,
+        "etf_flow": bundle.get("etf_flow"),
         "margin": margin_rows,
         "growth_value": gv_rows,
         "high_low": hl_rows,
@@ -821,6 +890,7 @@ def write_web_snapshot(
     payload: dict[str, Any] | None = None,
     *,
     index_symbol: str = DEFAULT_WEEKLY_INDEX,
+    output_dir: str | os.PathLike[str] | None = None,
 ) -> str:
     """把当前库（或已有 payload）写成可离线打开的 web_snapshot。"""
     import json
@@ -835,7 +905,7 @@ def write_web_snapshot(
 
     web = Path(__file__).resolve().parents[3] / "web" / "dp_cycle"
     index = web / "index.html"
-    out_dir = Path(dp_cycle_store_dir()) / "web_snapshot"
+    out_dir = Path(output_dir) if output_dir is not None else Path(dp_cycle_store_dir()) / "web_snapshot"
     out_dir.mkdir(parents=True, exist_ok=True)
     for name in ("lightweight-charts.js", "styles.css", "app.js"):
         src = web / name

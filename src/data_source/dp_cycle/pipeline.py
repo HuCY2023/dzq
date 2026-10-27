@@ -36,6 +36,7 @@ def run_dp_cycle_pipeline(
     index_symbol: str = DEFAULT_WEEKLY_INDEX,
     bundle: dict[str, Any] | None = None,
     diagnosis: dict[str, Any] | None = None,
+    publish_latest: bool = True,
 ) -> dict[str, Any]:
     """更新/读取库 → 落盘图表与长期跟踪 PDF。"""
     del margin_lookback_years
@@ -149,19 +150,20 @@ def run_dp_cycle_pipeline(
         pngs=png_map,
         tables=bundle,
         diagnosis=diagnosis,
-        latest_copy=latest,
+        latest_copy=latest if publish_latest else None,
     )
     import shutil
 
-    os.makedirs(os.path.dirname(research_copy), exist_ok=True)
-    # Preserve the reference PDF shipped with the repository.
-    if not os.path.exists(research_copy):
-        shutil.copy2(long_path, research_copy)
+    if publish_latest:
+        os.makedirs(os.path.dirname(research_copy), exist_ok=True)
+        # Preserve the reference PDF shipped with the repository.
+        if not os.path.exists(research_copy):
+            shutil.copy2(long_path, research_copy)
 
     meta["pngs"] = png_map
     meta["pdf"] = long_path
-    meta["pdf_latest"] = latest
-    meta["pdf_research"] = research_copy
+    meta["pdf_latest"] = latest if publish_latest else None
+    meta["pdf_research"] = research_copy if publish_latest else None
     report.write_meta(os.path.join(out, "scan_meta.txt"), meta)
     with open(os.path.join(out, "scan_meta_summary.txt"), "w", encoding="utf-8") as f:
         f.write(f"dp_cycle pipeline\nout={out}\nhistory_start={HISTORY_START_STR}\npdf={long_path}\n")

@@ -95,7 +95,9 @@ def plot_margin(df: pd.DataFrame, out_path: str) -> str | None:
         return None
     fig, axes = plt.subplots(3, 1, figsize=(11, 9), constrained_layout=True)
     fig.suptitle("03 杠杆资金：沪深融资余额", fontsize=13)
-    d = df.copy()
+    from data_source.dp_cycle.margin import enrich_margin
+
+    d = enrich_margin(df)
     d["date"] = pd.to_datetime(d["date"])
     if "月变化_亿元" not in d.columns and "融资余额_亿元" in d.columns:
         s = d.dropna(subset=["融资余额_亿元"]).set_index("date")["融资余额_亿元"].sort_index()
@@ -125,12 +127,12 @@ def plot_margin(df: pd.DataFrame, out_path: str) -> str | None:
     ax.grid(True, alpha=0.3)
 
     ax = axes[2]
-    ax.plot(d["date"], d["分位_全样本"], color="#5b8ff9", lw=1.1, label="全样本分位%")
+    ax.plot(d["date"], d["分位_全样本"], color="#5b8ff9", lw=1.1, label="截至当期历史分位%")
     if "分位_近N年" in d.columns:
         ax.plot(d["date"], d["分位_近N年"], color="#f6bd16", lw=1.1, label="近N年分位%")
     ax.set_ylabel("%")
     ax.set_ylim(0, 100)
-    ax.set_title("历史分位（窗口见 scan_meta）")
+    ax.set_title("截至当期的历史分位")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 

@@ -49,7 +49,7 @@ SCORE_RULES: dict[str, str] = {
     "main_force": "周净流出 ≥2000 → −2；≥1000 → −1。只作风控，偶发净流入不当作看多。",
     "national_team": "观察核心宽基ETF份额分位和相邻月份额变化，不参与总分或仓位判断。",
     "margin": (
-        "不看单纯增减，看融资余额历史分位 × 近约21日方向。"
+        "不看单纯增减，看融资余额截至当期的历史分位 × 20个交易日间隔的方向。"
         "高位持续加 → −3（风险升，警惕离开）；高位去杠杆 → −2；"
         "低位加 → +2、低位减 → −1（低位变动宜跟随）；中位 ±1。"
     ),
@@ -110,14 +110,24 @@ def _prep(df: pd.DataFrame | None, cols: list[str]) -> pd.DataFrame:
 
 
 def _through(
-    frame: pd.DataFrame | None, end: pd.Timestamp, *, available_at_end: pd.Timestamp | None = None
+    frame: pd.DataFrame | None, end: pd.Timestamp, *, available_at_end: pd.Timestamp | None = None,
+    preserve_unknown_missing: str | None = None,
 ) -> pd.DataFrame | None:
     if not isinstance(frame, pd.DataFrame) or "date" not in frame.columns:
         return frame
     dates = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
     visible = dates <= end
     if "available_at" in frame.columns:
-        visible &= pd.to_datetime(frame["available_at"], errors="coerce") <= (available_at_end if available_at_end is not None else end)
+        if preserve_unknown_missing:
+            from data_source.dp_cycle.margin import _margin_local_timestamps
+            released = _margin_local_timestamps(frame["available_at"])
+        else:
+            released = pd.to_datetime(frame["available_at"], errors="coerce")
+        available = released <= (available_at_end if available_at_end is not None else end)
+        if preserve_unknown_missing and preserve_unknown_missing in frame.columns:
+            missing = pd.to_numeric(frame[preserve_unknown_missing], errors="coerce").isna()
+            available |= released.isna() & missing
+        visible &= available
     return frame.loc[visible].copy()
 
 
@@ -159,7 +169,8 @@ def _mark_unavailable(item: dict[str, Any], availability: dict[str, Any]) -> Non
     if availability["status"] != "ok":
         item["status"] = availability["status"]
         item["score"] = None
-        item["note"] = f"{availability['reason']}；{item['note']}"
+        if availability["reason"] != item["note"]:
+            item["note"] = f"{availability['reason']}；{item['note']}"
         for key in ("zone", "trend", "direction"):
             item.pop(key, None)
 
@@ -237,30 +248,22 @@ def _item(
     }
 
 
-def _margin_item(margin: pd.DataFrame) -> dict[str, Any]:
-    x = _prep(margin, ["融资余额_亿元", "分位_全样本"])
-    if x.empty or "融资余额_亿元" not in x.columns:
-        return _item("margin", "杠杆", score=None, note="无融资余额", status="gap")
-    x = x.dropna(subset=["融资余额_亿元"])
-    if len(x) < 25:
-        return _item("margin", "杠杆", score=None, note="融资余额样本不足一月", status="gap")
-    last = x.iloc[-1]
-    prev = x.iloc[-21]
-    delta = float(last["融资余额_亿元"] - prev["融资余额_亿元"])
-    pct_v = _as_pct(float(last["分位_全样本"]) if pd.notna(last.get("分位_全样本")) else None)
-    if pct_v is None:
-        return _item("margin", "杠杆", score=None, note=f"{pd.Timestamp(last['date']).date()} 融资缺少分位", status="gap")
-    score, zone, trend, tag = score_margin_regime(pct_v, delta)
-    pct_txt = f"，全样本分位 {pct_v:.0f}%（{zone}）" if pct_v is not None else "，无分位"
-    note = (
-        f"{pd.Timestamp(last['date']).date()} 融资 {float(last['融资余额_亿元']):.0f} 亿"
-        f"{pct_txt}，约21日 {delta:+.0f} 亿（{trend}）。{tag}"
-    )
-    out = _item("margin", "杠杆", score=score, note=note, status="ok")
-    out["zone"] = zone
-    out["trend"] = trend
-    out["direction"] = {"up": "in", "down": "out", "flat": "flat"}.get(trend, "flat")
-    out["pct"] = pct_v
+def _margin_item(margin: pd.DataFrame, *, trade_calendar: dict[str, Any] | None = None) -> dict[str, Any]:
+    from data_source.dp_cycle.margin import margin_signal_at
+
+    signal = margin_signal_at(margin, trade_calendar=trade_calendar)
+    if signal["status"] != "ok":
+        return _item("margin", "杠杆", score=None, note=signal["reason"], status=signal["status"])
+    interval = "20个交易日间隔" if signal["calendar_verified"] else "20个观测日间隔（未核验交易日历）"
+    note = (f"{signal['date'].date()} 融资 {signal['balance']:.0f} 亿，"
+            f"截至当期历史分位 {signal['pct']:.0f}%（{signal['zone']}），"
+            f"{interval} {signal['delta']:+.0f} 亿（{signal['trend']}）。{signal['tag']}")
+    out = _item("margin", "杠杆", score=signal["score"], note=note, status="ok")
+    out["zone"] = signal["zone"]
+    out["trend"] = signal["trend"]
+    out["direction"] = {"up": "in", "down": "out", "flat": "flat"}.get(signal["trend"], "flat")
+    out["pct"] = signal["pct"]
+    out["delta_20"] = signal["delta"]
     return out
 
 
@@ -607,10 +610,15 @@ def score_history_weekly(
     性能优化：预转换 numpy 数组 + searchsorted 索引查找，避免每次循环创建 Series。
     """
     import numpy as np
+    from data_source.dp_cycle.margin import (
+        _margin_local_timestamp, _margin_local_timestamps, causal_margin_frame, margin_signal_at, margin_signal_from_row,
+    )
 
     validate_rule_version(rule_version)
     weekly = _prep(bundle.get("weekly"), ["close"])
     margin = _prep(bundle.get("margin"), ["融资余额_亿元", "分位_全样本"])
+    if "available_at" in margin.columns:
+        margin["available_at"] = _margin_local_timestamps(margin["available_at"])
     gv = _prep(bundle.get("growth_value"), ["偏离度"])
     hl = _prep(bundle.get("high_low"), ["new_high", "new_low"])
     unlock = _prep(bundle.get("unlock_daily"), ["amount_yi"])
@@ -624,7 +632,7 @@ def score_history_weekly(
     else:
         return []
     if as_of is not None:
-        cutoff = pd.Timestamp(as_of).normalize()
+        cutoff = _margin_local_timestamp(as_of).normalize()
         anchors = [anchor for anchor in anchors if anchor <= cutoff]
 
     # ── 预转换 numpy 数组 + 日期索引，避免循环内重复 .loc[:end] ──
@@ -635,18 +643,10 @@ def score_history_weekly(
         idx = pd.DatetimeIndex(series.index).as_unit("ns").asi8
         return idx, series.to_numpy(dtype=float, na_value=np.nan)
 
-    # 融资
-    if not margin.empty:
-        _m = margin.dropna(subset=["融资余额_亿元"]).set_index("date").sort_index()
-        m_lvl_i8, m_lvl_v = _to_np(_m["融资余额_亿元"])
-    else:
-        m_lvl_i8, m_lvl_v = np.array([], dtype="int64"), np.array([], dtype=float)
-
-    if not margin.empty and "分位_全样本" in margin.columns:
-        _mp = margin.dropna(subset=["分位_全样本"]).set_index("date").sort_index()
-        m_pct_i8, m_pct_v = _to_np(_mp["分位_全样本"])
-    else:
-        m_pct_i8, m_pct_v = np.array([], dtype="int64"), np.array([], dtype=float)
+    # 每个时点使用相同的融资单期计算；有发布时间时逐周核对可知性。
+    m_frame = causal_margin_frame(margin, trade_calendar=bundle.get("trade_calendar"))
+    m_i8 = (pd.DatetimeIndex(m_frame["date"]).as_unit("ns").asi8
+            if not m_frame.empty else np.array([], dtype="int64"))
 
     # 偏离度
     if not gv.empty:
@@ -677,14 +677,19 @@ def score_history_weekly(
     # 主力周合计
     mf_w_v = np.array([], dtype=float)
     mf_w_i8 = np.array([], dtype="int64")
+    mf_days_i8 = np.array([], dtype="int64")
     gap_w_v = np.array([], dtype=float)
     gap_w_i8 = np.array([], dtype="int64")
-    if not mf.empty and len(mf) >= 20:
-        _mw = mf.set_index("date").sort_index()["净额_亿元"].resample("W-FRI").sum(min_count=1).dropna()
+    gap_days_i8 = np.array([], dtype="int64")
+    if not mf.empty and "净额_亿元" in mf.columns:
+        valid_mf = mf.dropna(subset=["净额_亿元"])
+        mf_days_i8 = pd.DatetimeIndex(valid_mf["date"]).as_unit("ns").asi8
+        _mw = valid_mf.set_index("date")["净额_亿元"].resample("W-FRI").sum(min_count=1).dropna()
         mf_w_i8, mf_w_v = _to_np(_mw)
         if {"中单_亿元", "小单_亿元"} <= set(mf.columns):
             g = mf.dropna(subset=["净额_亿元", "中单_亿元", "小单_亿元"]).copy()
-            if len(g) >= 20:
+            gap_days_i8 = pd.DatetimeIndex(g["date"]).as_unit("ns").asi8
+            if not g.empty:
                 g["_gap"] = g["净额_亿元"] - (g["中单_亿元"] + g["小单_亿元"])
                 _gw = g.set_index("date").sort_index()["_gap"].resample("W-FRI").sum(min_count=1).dropna()
                 gap_w_i8, gap_w_v = _to_np(_gw)
@@ -697,7 +702,6 @@ def score_history_weekly(
         return _to_np(s)
 
     issue_w_i8, issue_w_v = _ws_np(bundle.get("fund_issue"), "shares_yi")
-    reduce_w_i8, reduce_w_v = _ws_np(bundle.get("holder_reduce"), "amount_yi")
     ind = _prep(bundle.get("industry_flow_daily"), ["net_yi"])
     industry_scores: dict[pd.Timestamp, int] = {}
     if not ind.empty:
@@ -761,15 +765,21 @@ def score_history_weekly(
                     scored += 1
 
         # 融资
-        mi = int(np.searchsorted(m_lvl_i8, end_i8, side="right"))
-        if mi >= 22:
-            delta = float(m_lvl_v[mi - 1] - m_lvl_v[mi - 22])
-            mpi = int(np.searchsorted(m_pct_i8, end_i8, side="right"))
-            pct_raw = float(m_pct_v[mpi - 1]) if mpi > 0 else None
-            pct_v = _as_pct(pct_raw)
-            sc_m, _, _, _ = score_margin_regime(pct_v, delta)
-            total += sc_m
-            scored += 1
+        mi = int(np.searchsorted(m_i8, end_i8, side="right"))
+        if mi:
+            latest = m_frame.iloc[mi - 1]
+            released = pd.to_datetime(latest.get("available_at"), errors="coerce")
+            missing_visible = (pd.isna(latest["融资余额_亿元"])
+                               and (pd.isna(released) or released <= end_ts))
+            if missing_visible:
+                signal = margin_signal_from_row(latest)
+            elif "available_at" in margin.columns:
+                signal = margin_signal_at(margin, as_of=end_ts, trade_calendar=bundle.get("trade_calendar"))
+            else:
+                signal = margin_signal_from_row(latest)
+            if signal["status"] == "ok":
+                total += signal["score"]
+                scored += 1
 
         # 偏离度
         di = int(np.searchsorted(div_i8, end_i8, side="right"))
@@ -811,7 +821,8 @@ def score_history_weekly(
 
         # 主力周合计
         mfi = int(np.searchsorted(mf_w_i8, end_i8, side="right"))
-        if mfi > 0:
+        if (mfi > 0 and mf_w_i8[mfi - 1] == end_i8
+                and np.searchsorted(mf_days_i8, end_i8, side="right") >= 20):
             last_mf = float(mf_w_v[mfi - 1])
             if last_mf <= MAIN_FORCE_WEEK_EXTREME:
                 total -= 2
@@ -821,7 +832,8 @@ def score_history_weekly(
 
         # 剪刀差
         gi = int(np.searchsorted(gap_w_i8, end_i8, side="right"))
-        if gi > 0:
+        if (rule_version == "author_v1" and gi > 0 and gap_w_i8[gi - 1] == end_i8
+                and np.searchsorted(gap_days_i8, end_i8, side="right") >= 20):
             total += score_scissors(float(gap_w_v[gi - 1]))
             scored += 1
 
@@ -831,11 +843,7 @@ def score_history_weekly(
             total += score_fund_issue(float(issue_w_v[ii - 1]), float(issue_w_v[ii - 2]))
             scored += 1
 
-        # 减持
-        ri = int(np.searchsorted(reduce_w_i8, end_i8, side="right"))
-        if ri >= 2:
-            total += score_holder_reduce(float(reduce_w_v[ri - 1]), float(reduce_w_v[ri - 2]))
-            scored += 1
+        # 缺逐期分页完整性证明，历史曲线暂不计入减持。
 
         # 行业资金
         if end_ts in industry_scores:
@@ -919,6 +927,38 @@ def _holder_reduce_item(raw: pd.DataFrame | None) -> dict[str, Any]:
         note=f"{day} 当周 {last:.0f} 亿，上周 {prev:.0f}。{tag}。按公告变动截止日，不是成交日。",
         status="ok",
     )
+
+
+def _holder_window_item(
+    raw: pd.DataFrame | None, *, period_end: pd.Timestamp, as_of: pd.Timestamp,
+    source_complete: bool = False,
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    """减持按公告可知时间过滤；未知公告日的近期记录使该项不完整。"""
+    if not isinstance(raw, pd.DataFrame) or raw.empty or "date" not in raw.columns:
+        return _item("holder_reduce", "减持", score=None, note="无减持记录", status="gap"), pd.DataFrame()
+    recent = raw.loc[(raw["date"] > period_end - pd.Timedelta(weeks=10)) & (raw["date"] <= period_end)].copy()
+    if recent.empty:
+        return _item("holder_reduce", "减持", score=None, note="近期无减持记录", status="gap"), recent
+    if "notice_date" not in recent.columns:
+        return _item("holder_reduce", "减持", score=None, note="缺少可核验的公告日期", status="partial"), recent.iloc[0:0]
+    from data_source.dp_cycle.holder_reduce import visible_holder_reductions
+
+    visible, stats = visible_holder_reductions(recent, as_of=as_of)
+    if stats["notice_unknown"]:
+        return _item("holder_reduce", "减持", score=None,
+                     note=f"近期 {stats['notice_unknown']} 条公告日期无法确认，仅作观察，不计分", status="partial"), visible
+    for week_end in (period_end, period_end - pd.Timedelta(days=7)):
+        week = visible.loc[(visible["date"] > week_end - pd.Timedelta(days=7)) & (visible["date"] <= week_end)]
+        if week.empty:
+            return _item("holder_reduce", "减持", score=None,
+                         note=f"{week_end.date()} 当周缺少已公告记录，不能以前一周代替", status="gap"), visible
+        if "amount_yi" not in week.columns or pd.to_numeric(week["amount_yi"], errors="coerce").isna().any():
+            return _item("holder_reduce", "减持", score=None,
+                         note=f"{week_end.date()} 当周存在金额缺失，无法计算完整周合计", status="partial"), visible
+    if not source_complete:
+        return _item("holder_reduce", "减持", score=None,
+                     note="未保存该时点的分页完整性证明，仅作观察，不计分", status="partial"), visible
+    return _holder_reduce_item(visible), visible
 
 
 def _industry_week_coverage(
@@ -1113,9 +1153,11 @@ def diagnose_position(
     heavy=False：跳过历史阶段表 / 评分曲线（各约数百 ms～1s+），供 GUI 读库快路径；
     完整表在「更新入库」或 payload 缓存未命中后的后台补全时再算。
     """
+    from data_source.dp_cycle.margin import _margin_local_timestamp
+
     validate_rule_version(rule_version)
     author = rule_version == "author_v1"
-    cutoff = pd.Timestamp(as_of if as_of is not None else date.today()).normalize()
+    cutoff = _margin_local_timestamp(as_of if as_of is not None else date.today()).normalize()
     has_etf_history = isinstance(bundle.get("etf_hist"), pd.DataFrame) and not bundle["etf_hist"].empty
     bundle = dict(bundle)
     for key in (
@@ -1123,7 +1165,7 @@ def diagnose_position(
         "growth_value", "high_low", "fund_issue", "holder_reduce", "industry_flow_daily",
     ):
         if key in bundle:
-            bundle[key] = _through(bundle[key], cutoff)
+            bundle[key] = _through(bundle[key], cutoff, preserve_unknown_missing="融资余额_亿元" if key == "margin" else None)
     if has_etf_history:
         from data_source.dp_cycle.national_team_etf import monthly_share_change
 
@@ -1173,7 +1215,7 @@ def diagnose_position(
     holder_reduce_complete = _through(bundle.get("holder_reduce"), completed_end)
     industry_flow_complete = _through(bundle.get("industry_flow_daily"), completed_end)
 
-    margin_item = _margin_item(bundle.get("margin"))
+    margin_item = _margin_item(bundle.get("margin"), trade_calendar=calendar)
     div_item, div_shape = _divergence_item(bundle.get("growth_value"))
     br_item, br_shape = _breadth_item(bundle.get("high_low"), bundle.get("weekly"))
     unlock_item, unlock_hot = _unlock_item(bundle.get("unlock_daily"), as_of=cutoff)
@@ -1183,7 +1225,9 @@ def diagnose_position(
         nt_item["rule"] = AUTHOR_ETF_RULE
     sc_item = _scissors_item(main_force_complete)
     fi_item = _fund_issue_item(fund_issue_complete)
-    hr_item = _holder_reduce_item(holder_reduce_complete)
+    hr_item, holder_visible = _holder_window_item(
+        _prep(holder_reduce_complete, ["amount_yi"]), period_end=completed_end, as_of=cutoff,
+    )
     ind_item = _industry_flow_item(industry_flow_complete, period_end=completed_end, calendar=calendar)
     current_industry, _ = _industry_week_coverage(
         bundle.get("industry_flow_daily"), current_end, calendar=calendar, observed_until=cutoff,
@@ -1211,19 +1255,22 @@ def diagnose_position(
         "breadth": _availability(bundle.get("high_low"), ["new_high", "new_low"], cutoff, 10, item=br_item),
         "scissors": _availability(main_force_complete, ["净额_亿元", "中单_亿元", "小单_亿元"], cutoff, 10, item=sc_item),
         "fund_issue": _availability(fund_issue_complete, ["shares_yi"], cutoff, 14, item=fi_item),
-        "holder_reduce": _availability(holder_reduce_complete, ["amount_yi"], cutoff, 14, item=hr_item),
+        "holder_reduce": _availability(holder_visible, ["amount_yi"], cutoff, 14, item=hr_item),
         "industry_flow": _availability(industry_flow_complete, ["net_yi"], cutoff, 10, item=ind_item),
     }
     raw_margin = _prep(bundle.get("margin"), ["融资余额_亿元"])
     if not raw_margin.empty and "融资余额_亿元" in raw_margin.columns:
         latest_day = raw_margin["date"].max()
         if raw_margin.loc[raw_margin["date"] == latest_day, "融资余额_亿元"].isna().all():
-            if availability["margin"]["status"] == "ok":
+            if raw_margin["融资余额_亿元"].notna().any():
                 availability["margin"]["status"] = "partial"
                 availability["margin"]["reason"] = f"{latest_day.date()} 融资余额缺少完整沪深数据"
     if ind_item["status"] == "partial" and availability["industry_flow"]["status"] == "gap":
         availability["industry_flow"]["status"] = "partial"
         availability["industry_flow"]["reason"] = "目标行业覆盖不足"
+    if hr_item["status"] == "partial":
+        availability["holder_reduce"]["status"] = "partial"
+        availability["holder_reduce"]["reason"] = hr_item["note"]
     if early_week and not weekly_proven:
         availability["weekly"]["status"] = "partial" if availability["weekly"]["period_end"] else "gap"
         availability["weekly"]["reason"] = "已结束短周的本周周K缺少截至分析日已可用的观测，不能以上周周K代替"
@@ -1288,6 +1335,10 @@ def diagnose_position(
         _mark_unavailable(item, availability[item["id"]])
     if not author and nt_item["status"] == "ok":
         nt_item["status"] = "info"
+    if not author and sc_item["status"] == "ok":
+        sc_item["status"] = "info"
+        sc_item["rule"] = "剪刀差仅供观察；主力与剪刀差使用相关数据，改进版只对主力计分。"
+        sc_item["note"] = sc_item["note"].replace("计负分", "仅供观察，不重复计分")
     if div_item["status"] != "ok":
         div_shape = "gap"
     if br_item["status"] != "ok":
@@ -1635,7 +1686,7 @@ def diagnose_position(
         "日常约 ±1/±2；多项同负才极端（如 −9）。"
         "硬信号优先 → 离场/减仓/持有/加仓/抄底。未参与评分的项目不记为 0。"
         if author else
-        "融资、主力、行为和解禁等可用项参与规则；宽基ETF份额变化仅作观察。"
+        "融资、主力、行为和解禁等可用项参与规则；宽基ETF份额和剪刀差仅作观察。"
         "未参与评分的项目不记为 0。规则尚未完成有效性验证。"
     )
 

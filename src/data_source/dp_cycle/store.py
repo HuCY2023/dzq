@@ -193,6 +193,7 @@ def init_schema(con: DuckDBPyConnection) -> None:
             holder VARCHAR,
             end_date DATE,
             notice_date DATE,
+            notice_known BOOLEAN,
             change_wan DOUBLE,
             close_price DOUBLE,
             amount_yi DOUBLE,
@@ -218,6 +219,7 @@ def init_schema(con: DuckDBPyConnection) -> None:
         "ALTER TABLE margin_daily ADD COLUMN IF NOT EXISTS sz_main_yi DOUBLE",
         "ALTER TABLE margin_daily ADD COLUMN IF NOT EXISTS chinext_yi DOUBLE",
         "ALTER TABLE margin_daily ADD COLUMN IF NOT EXISTS star_yi DOUBLE",
+        "ALTER TABLE holder_reduce ADD COLUMN IF NOT EXISTS notice_known BOOLEAN",
     ):
         try:
             con.execute(stmt)
@@ -634,12 +636,24 @@ def load_from_db(
             FROM fund_issue WHERE found_date >= ? ORDER BY found_date
             """
         )
-        holder_reduce = _safe(
-            """
-            SELECT code, holder, end_date AS date, notice_date, change_wan, close_price, amount_yi
-            FROM holder_reduce WHERE end_date >= ? ORDER BY end_date
-            """
-        )
+        try:
+            holder_reduce = con.execute(
+                """
+                SELECT code, holder, end_date AS date, notice_date, notice_known, change_wan, close_price, amount_yi
+                FROM holder_reduce WHERE end_date >= ? ORDER BY end_date
+                """, [start_ts]
+            ).df()
+        except Exception:
+            # 只读旧库尚未迁移列时仍要保留记录，不在读取时改表。
+            holder_reduce = _safe(
+                """
+                SELECT code, holder, end_date AS date, notice_date, change_wan, close_price, amount_yi
+                FROM holder_reduce WHERE end_date >= ? ORDER BY end_date
+                """
+            )
+        from data_source.dp_cycle.holder_reduce import annotate_holder_notices
+
+        holder_reduce = annotate_holder_notices(holder_reduce)
         industry_flow = _safe(
             """
             SELECT date, bk_code, name, net_yi, mid_yi, small_yi

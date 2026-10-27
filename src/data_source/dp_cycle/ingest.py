@@ -155,15 +155,16 @@ def ingest_main_force(con, *, as_of: date | None = None) -> dict[str, Any]:
     return meta
 
 def ingest_etf_shares(con, *, as_of: date | None = None, backfill_months: int = 60) -> dict[str, Any]:
-    from data_source.dp_cycle.national_team_etf import backfill_core_etf_month_ends, snapshot_core_etfs
+    from data_source.dp_cycle.national_team_etf import _merge_history, backfill_core_etf_month_ends, snapshot_core_etfs
 
     hist, meta = snapshot_core_etfs(as_of=as_of)
     # 按月末回填缺口（已有月份跳过；默认约 5 年）
     if backfill_months > 0:
-        hist2, bf_meta = backfill_core_etf_month_ends(months=backfill_months)
+        hist2, bf_meta = backfill_core_etf_month_ends(months=backfill_months, as_of=as_of)
         meta["backfill"] = bf_meta
-        if not hist2.empty:
-            hist = hist2
+        hist = _merge_history(hist, hist2)
+        meta["partial"] = bool(meta.get("partial") or bf_meta.get("partial"))
+        meta["ok"] = bool(meta.get("ok") and bf_meta.get("ok"))
     hist = clip_from_2015(hist)
     if hist.empty:
         return {**meta, "wrote": 0}
@@ -176,6 +177,16 @@ def ingest_etf_shares(con, *, as_of: date | None = None, backfill_months: int = 
             "shares_yi": pd.to_numeric(hist.get("份额_亿份"), errors="coerce"),
         }
     )
+    # 两列是同一份额的不同单位；仅有一列时先按单位换算，避免与旧列混成不同日期的数值。
+    out["shares"] = out["shares"].combine_first(out["shares_yi"] * 1e8)
+    out["shares_yi"] = out["shares_yi"].combine_first(out["shares"] / 1e8)
+    existing = con.execute("SELECT date, code, name, shares, shares_yi FROM etf_shares_daily").df()
+    if not existing.empty:
+        existing["date"] = pd.to_datetime(existing["date"]).dt.date
+        out = out.merge(existing, on=["date", "code"], how="left", suffixes=("", "_cached"))
+        for field in ("name", "shares", "shares_yi"):
+            out[field] = out[field].combine_first(out[field + "_cached"])
+        out = out[["date", "code", "name", "shares", "shares_yi"]]
     n = upsert_dataframe(con, "etf_shares_daily", out, key_cols=["date", "code"])
     touch_series(con, "etf_shares_daily", last_date=_last(hist), note="SSE核心宽基+月末回填")
     return {**meta, "wrote": n}
@@ -496,22 +507,62 @@ def ingest_fund_issue(con) -> dict[str, Any]:
 
 
 def ingest_holder_reduce(con) -> dict[str, Any]:
-    from data_source.dp_cycle.holder_reduce import fetch_holder_reduces
+    from data_source.dp_cycle.holder_reduce import annotate_holder_notices, fetch_holder_reduces
 
     raw, meta = fetch_holder_reduces(start=HISTORY_START_STR)
     if raw is None or raw.empty:
         return {**meta, "wrote": 0}
+    raw = annotate_holder_notices(raw)
     out = pd.DataFrame(
         {
             "code": raw["code"].astype(str),
             "holder": raw["holder"].astype(str),
             "end_date": pd.to_datetime(raw["end_date"]).dt.date,
             "notice_date": pd.to_datetime(raw["notice_date"]).dt.date,
+            "notice_known": raw["notice_known"],
             "change_wan": pd.to_numeric(raw["change_wan"], errors="coerce"),
             "close_price": pd.to_numeric(raw["close_price"], errors="coerce"),
             "amount_yi": pd.to_numeric(raw["amount_yi"], errors="coerce"),
         }
     )
+    # 同键旧记录的公告日已核验时，不能用本次缺失公告日的占位记录覆盖。
+    verified = pd.DataFrame()
+    if (~out["notice_known"].fillna(False)).any():
+        verified = con.execute(
+            "SELECT code, holder, end_date, notice_date FROM holder_reduce WHERE notice_known IS TRUE"
+        ).df()
+    if not verified.empty:
+        keys = ["code", "holder", "end_date", "notice_date"]
+        for col in ("end_date", "notice_date"):
+            verified[col] = pd.to_datetime(verified[col]).dt.date
+        old_keys = pd.MultiIndex.from_frame(verified[keys])
+        replace_unknown = ~out["notice_known"].fillna(False) & pd.MultiIndex.from_frame(out[keys]).isin(old_keys)
+        if replace_unknown.any():
+            meta = {**meta, "ok": False, "partial": True, "preserved_known_rows": int(replace_unknown.sum())}
+            out = out.loc[~replace_unknown].copy()
+    if out.empty:
+        return {**meta, "wrote": 0}
+    # 金额及其计算输入必须来自同一条记录，不能拼接新股数与旧金额。
+    if out["amount_yi"].isna().any():
+        meta = {**meta, "ok": False, "partial": True}
+        con.register("_holder_refresh", out)
+        try:
+            out = con.execute("""
+                SELECT incoming.code, incoming.holder, incoming.end_date, incoming.notice_date,
+                       incoming.notice_known,
+                       CASE WHEN incoming.amount_yi IS NULL AND existing.amount_yi IS NOT NULL
+                            THEN existing.change_wan ELSE incoming.change_wan END AS change_wan,
+                       CASE WHEN incoming.amount_yi IS NULL AND existing.amount_yi IS NOT NULL
+                            THEN existing.close_price ELSE incoming.close_price END AS close_price,
+                       CASE WHEN incoming.amount_yi IS NULL AND existing.amount_yi IS NOT NULL
+                            THEN existing.amount_yi ELSE incoming.amount_yi END AS amount_yi
+                FROM _holder_refresh AS incoming
+                LEFT JOIN holder_reduce AS existing
+                  ON incoming.code = existing.code AND incoming.holder = existing.holder
+                 AND incoming.end_date = existing.end_date AND incoming.notice_date = existing.notice_date
+            """).df()
+        finally:
+            con.unregister("_holder_refresh")
     n = upsert_dataframe(con, "holder_reduce", out, key_cols=["code", "holder", "end_date", "notice_date"])
     touch_series(con, "holder_reduce", last_date=_last(out, "end_date"), note="东财重要股东减持")
     return {**meta, "wrote": n}

@@ -345,17 +345,22 @@ def _as_of_month(frame: pd.DataFrame, value_cols: list[str]) -> pd.DataFrame:
     return out.groupby("date", as_index=False).last()
 
 
-def monthly_regimes(bundle: dict[str, Any], *, rule_version: str = "improved_v1") -> list[dict[str, Any]]:
+def monthly_regimes(
+    bundle: dict[str, Any], *, rule_version: str = "improved_v1", as_of: Any | None = None
+) -> list[dict[str, Any]]:
     """每个月末用和当前诊断同一套窗口打分，相邻同阶段合并。"""
     validate_rule_version(rule_version)
-    mcols = ["融资余额_亿元"]
+    from data_source.dp_cycle.margin import (
+        _margin_local_timestamps, causal_margin_frame, margin_signal_at, margin_signal_from_row,
+    )
+
     raw_m = bundle.get("margin") if isinstance(bundle.get("margin"), pd.DataFrame) else pd.DataFrame()
-    if isinstance(raw_m, pd.DataFrame) and "分位_全样本" in getattr(raw_m, "columns", []):
-        mcols.append("分位_全样本")
-    margin = _as_of_month(raw_m, mcols)
+    if "available_at" in raw_m.columns:
+        raw_m = raw_m.copy()
+        raw_m["available_at"] = _margin_local_timestamps(raw_m["available_at"])
+    margin = causal_margin_frame(raw_m, as_of=as_of, trade_calendar=bundle.get("trade_calendar"))
     if margin.empty or "融资余额_亿元" not in margin.columns:
         return []
-    margin = margin.dropna(subset=["融资余额_亿元"]).reset_index(drop=True)
 
     div = _as_of_month(bundle.get("growth_value") if isinstance(bundle.get("growth_value"), pd.DataFrame) else pd.DataFrame(), ["偏离度"])
     hl = _as_of_month(
@@ -363,7 +368,6 @@ def monthly_regimes(bundle: dict[str, Any], *, rule_version: str = "improved_v1"
         ["new_high", "new_low"],
     )
     month_last = margin.groupby(margin["date"].dt.to_period("M"), as_index=False).tail(1)
-    from data_source.dp_cycle.diagnosis import _as_pct
 
     etf_m = bundle.get("etf_monthly") if isinstance(bundle.get("etf_monthly"), pd.DataFrame) else pd.DataFrame()
     etf = pd.DataFrame()
@@ -379,12 +383,20 @@ def monthly_regimes(bundle: dict[str, Any], *, rule_version: str = "improved_v1"
     for end in month_last["date"]:
         end = pd.Timestamp(end).normalize()
         loc = int(margin.index[margin["date"] == end][-1])
-        if loc < 21:
+        latest = margin.loc[loc]
+        released = pd.to_datetime(latest.get("available_at"), errors="coerce")
+        missing_visible = pd.isna(latest["融资余额_亿元"]) and (pd.isna(released) or released <= end)
+        signal = (margin_signal_from_row(latest) if missing_visible else
+                  margin_signal_at(raw_m, as_of=end, trade_calendar=bundle.get("trade_calendar"))
+                  if "available_at" in margin.columns else margin_signal_from_row(latest))
+        if signal["status"] != "ok":
+            view = allocation_view("unclear", partial=True, rule_version=rule_version)
+            rows.append({"date": end.strftime("%Y-%m-%d"), "phase_id": "unclear", "stage": "数据不足",
+                         "actor": view["actor"], "side": view["side"], "equity_text": "",
+                         "basis": signal["reason"], "leverage": None, "margin_status": signal["status"],
+                         "margin_pct": None, "margin_delta_20": None, "margin_observation_date": None})
             continue
-        delta = float(margin.loc[loc, "融资余额_亿元"] - margin.loc[loc - 21, "融资余额_亿元"])
-        pct_raw = margin.loc[loc].get("分位_全样本") if "分位_全样本" in margin.columns else None
-        pct_v = _as_pct(float(pct_raw) if pd.notna(pct_raw) else None)
-        lev, m_zone, m_trend, _ = score_margin_regime(pct_v, delta)
+        lev, m_zone, m_trend = signal["score"], signal["zone"], signal["trend"]
 
         nt_zone, nt_trend, nt_score = "gap", "flat", None
         if rule_version == "author_v1" and not etf.empty:
@@ -443,6 +455,10 @@ def monthly_regimes(bundle: dict[str, Any], *, rule_version: str = "improved_v1"
                 "equity_text": view["equity_text"],
                 "basis": view["basis"],
                 "leverage": lev,
+                "margin_status": "ok",
+                "margin_pct": signal["pct"],
+                "margin_delta_20": signal["delta"],
+                "margin_observation_date": signal["date"].strftime("%Y-%m-%d"),
             }
         )
     if not rows:
@@ -452,8 +468,10 @@ def monthly_regimes(bundle: dict[str, Any], *, rule_version: str = "improved_v1"
     cur["start"] = cur["date"]
     cur["end"] = cur["date"]
     for row in rows[1:]:
-        if row["phase_id"] == cur["phase_id"]:
+        if row["phase_id"] == cur["phase_id"] and row["margin_status"] == cur["margin_status"]:
             cur["end"] = row["date"]
+            for key in ("leverage", "margin_status", "margin_pct", "margin_delta_20", "margin_observation_date"):
+                cur[key] = row[key]
         else:
             segments.append(cur)
             cur = dict(row)
