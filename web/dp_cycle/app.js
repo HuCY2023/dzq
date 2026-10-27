@@ -1262,6 +1262,26 @@
       unlockMonthRows.length ||
       unlockQuarterRows.length;
 
+    const etfFlowText = el("etfFlowText");
+    if (etfFlowText) {
+      const flow = data.etf_flow || {};
+      const coverage = flow.coverage || {};
+      if (!flow.date) {
+        etfFlowText.textContent = flow.reason || "尚无可用的四基金份额和净值快照。";
+      } else {
+        const amount = Number.isFinite(Number(flow.flow_yi)) && flow.flow_yi != null
+          ? Number(flow.flow_yi).toFixed(2) + " 亿元" : "不可计算";
+        const components = (flow.components || []).map((item) =>
+          item.code + " " + (item.flow_yi == null ? "缺" : Number(item.flow_yi).toFixed(2))
+        ).join("，");
+        etfFlowText.textContent = flow.date + " · " + (coverage.comparable || 0) + "/" +
+          (coverage.expected || 4) + " 只可比较 · 份额×净值估算 " + amount +
+          (components ? "；逐只（亿元）：" + components : "") +
+          (flow.reason ? "；" + flow.reason.replace(/[。；]+$/, "") : "") +
+          ((flow.source || {}).events_recorded === false ? "；旧导入的份额事件表未留存，版本不可追溯" : "") +
+          "。估算可能包含转托管，非实际现金流，也不能识别交易主体；历史不用于可交易回测。该快照需手动重新导入。";
+      }
+    }
     try { renderQuality(data); } catch (e) { console.warn("renderQuality", e); }
     try { renderDiagnosis(data); } catch (e) { console.warn("renderDiagnosis", e); }
 
