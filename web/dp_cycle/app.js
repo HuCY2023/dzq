@@ -197,7 +197,7 @@
           bits.push({ label: "融资", cache: ser.margin.__dataCacheOv });
         }
         if (etfOn && ser.etf && ser.etf.__dataCacheOv) {
-          bits.push({ label: "郭嘉队ETF", cache: ser.etf.__dataCacheOv });
+          bits.push({ label: "宽基ETF", cache: ser.etf.__dataCacheOv });
         }
         wrap.chart.__overlays = bits;
       }
@@ -345,6 +345,8 @@
     }
     const fw = el("diagFramework");
     if (fw) fw.textContent = d.framework || "散户决策";
+    const analysisDate = el("analysisDate");
+    if (analysisDate) analysisDate.textContent = d.as_of ? "分析日期 " + d.as_of : "";
     const dec = d.decision || {};
     const dLab = el("decisionLabel");
     if (dLab) {
@@ -371,17 +373,34 @@
     }
     stateNode.textContent = d.state ? ("位置：" + d.state) : "";
     if (summary) summary.textContent = d.summary || "";
+    const currentWeek = el("currentWeek");
+    if (currentWeek) {
+      const week = d.current_week || {};
+      if (week.period_complete !== true && week.last_observation_date) {
+        const total = week.main_force == null ? "" : "，主力累计 " + Number(week.main_force).toFixed(1) + " 亿";
+        const completion = week.period_complete === false ? "本周未结束" : "本周是否收盘未核验";
+        currentWeek.textContent = "本周截至 " + week.last_observation_date + "（" +
+          week.observed_trading_days + " 个交易日）" + total + "；" + completion + "，未按完整周评分。";
+      } else {
+        currentWeek.textContent = "";
+      }
+    }
 
     const allItems = d.items || [];
-    const inScore = allItems.filter((it) => it.status !== "gap" && it.score != null);
-    const gapItems = allItems.filter((it) => it.status === "gap" || it.score == null);
+    const infoItems = allItems.filter((it) => it.status === "info");
+    const staleItems = allItems.filter((it) => it.status === "stale");
+    const partialItems = allItems.filter((it) => it.status === "partial");
+    const inScore = allItems.filter((it) => it.status === "ok" && it.score != null);
+    const gapItems = allItems.filter((it) => !["info", "stale", "partial"].includes(it.status) && (it.status === "gap" || it.score == null));
     const total = d.score;
     const fmtSc = (v) => (v == null ? "—" : (v > 0 ? "+" + v : String(v)));
 
     if (score) {
-      score.textContent = inScore.length
-        ? inScore.length + " 项进分 · " + gapItems.length + " 项缺"
-        : "暂无进分项";
+      score.textContent = (inScore.length ? inScore.length + " 项进分" : "暂无进分项") +
+        (infoItems.length ? " · " + infoItems.length + " 项仅观察" : "") +
+        " · " + gapItems.length + " 项缺" +
+        (staleItems.length ? " · " + staleItems.length + " 项陈旧" : "") +
+        (partialItems.length ? " · " + partialItems.length + " 项部分覆盖" : "");
     }
     const big = el("scoreBig");
     if (big) {
@@ -399,7 +418,10 @@
     if (sumBar) {
       sumBar.innerHTML =
         "<span class=\"ss-pill in\">进分 <b>" + inScore.length + "</b></span>" +
+        (infoItems.length ? "<span class=\"ss-pill\">仅观察 <b>" + infoItems.length + "</b></span>" : "") +
         "<span class=\"ss-pill gap\">缺 <b>" + gapItems.length + "</b></span>" +
+        (staleItems.length ? "<span class=\"ss-pill gap\">陈旧 <b>" + staleItems.length + "</b></span>" : "") +
+        (partialItems.length ? "<span class=\"ss-pill gap\">部分覆盖 <b>" + partialItems.length + "</b></span>" : "") +
         "<span class=\"ss-pill total " +
         (total != null && total < 0 ? "neg" : total != null && total > 0 ? "pos" : "") +
         "\">汇总 <b>" + fmtSc(total) + "</b></span>";
@@ -407,6 +429,13 @@
     const formula = el("scoreFormula");
     if (formula) {
       const parts = allItems.map((it) => {
+        if (it.status === "info") {
+          return "<span>" + (it.label || it.id) + "(观察)</span>";
+        }
+        if (it.status === "stale" || it.status === "partial") {
+          return "<span class=\"sf-gap\">" + (it.label || it.id) + "(" +
+            (it.status === "stale" ? "陈旧" : "部分覆盖") + ")</span>";
+        }
         if (it.status === "gap" || it.score == null) {
           return "<span class=\"sf-gap\">" + (it.label || it.id) + "(缺)</span>";
         }
@@ -423,9 +452,12 @@
       tbody.innerHTML = "";
       allItems.forEach((it) => {
         const tr = document.createElement("tr");
-        const isGap = it.status === "gap" || it.score == null;
-        const scCls = isGap ? "gap" : it.score < 0 ? "neg" : it.score > 0 ? "pos" : "flat";
-        tr.className = "score-row " + scCls + (isGap ? " is-gap" : " is-in");
+        const isInfo = it.status === "info";
+        const isGap = !isInfo && (it.status === "gap" || it.score == null);
+        const statusLabel = isInfo ? "仅观察" : it.status === "stale" ? "陈旧" :
+          it.status === "partial" ? "部分覆盖" : isGap ? "缺" : "进分";
+        const scCls = isGap || isInfo ? "gap" : it.score < 0 ? "neg" : it.score > 0 ? "pos" : "flat";
+        tr.className = "score-row " + scCls + (isGap || isInfo ? " is-gap" : " is-in");
         const paneId = SCORE_PANE[it.id] || "";
         if (paneId) {
           tr.classList.add("is-jump");
@@ -435,9 +467,9 @@
         const reason = (it.note || "").trim() || (isGap ? "无序列，不进分" : "—");
         const ruleTip = it.rule ? "<div class=\"sr-rule\">规则：" + it.rule + "</div>" : "";
         tr.innerHTML =
-          "<td><span class=\"sr-badge\">" + (isGap ? "缺" : "进分") + "</span></td>" +
+          "<td><span class=\"sr-badge\">" + statusLabel + "</span></td>" +
           "<td class=\"sr-lab\">" + (it.label || it.id) + "</td>" +
-          "<td class=\"sr-sc\">" + (isGap ? "—" : fmtSc(it.score)) + "</td>" +
+          "<td class=\"sr-sc\">" + (isGap || isInfo ? "—" : fmtSc(it.score)) + "</td>" +
           "<td class=\"sr-why\">" + reason + ruleTip + "</td>";
         tbody.appendChild(tr);
       });
@@ -446,7 +478,10 @@
     if (hint) {
       hint.textContent = inScore.length
         ? "进分 " + inScore.map((it) => it.label).join("、") +
-          (gapItems.length ? " · 未进分 " + gapItems.map((it) => it.label).join("、") : "")
+          (infoItems.length ? " · 仅观察 " + infoItems.map((it) => it.label).join("、") : "") +
+          (staleItems.length ? " · 陈旧 " + staleItems.map((it) => it.label).join("、") : "") +
+          (partialItems.length ? " · 部分覆盖 " + partialItems.map((it) => it.label).join("、") : "") +
+          (gapItems.length ? " · 缺失 " + gapItems.map((it) => it.label).join("、") : "")
         : "有数才进分 · 缺的不记 0 · 点行跳图";
     }
 
@@ -495,10 +530,11 @@
       redGrid.innerHTML = "";
       (red.flags || []).forEach((f) => {
         const card = document.createElement("div");
-        card.className = "red-card " + (f.on ? "on" : "off");
+        const unknown = f.status === "unknown" || f.on == null;
+        card.className = "red-card " + (unknown ? "unknown" : f.on ? "on" : "off");
         card.innerHTML =
           "<div class=\"rt\">" + (f.label || "") + "</div>" +
-          "<div class=\"rs\">" + (f.on ? "亮" : "灭") + "</div>" +
+          "<div class=\"rs\">" + (unknown ? "未知" : f.on ? "亮" : "灭") + "</div>" +
           "<div class=\"rn\">" + (f.note || "") + "</div>";
         redGrid.appendChild(card);
       });
@@ -510,7 +546,7 @@
     }
     const redHint = el("redLightHint");
     if (redHint && red.lit != null) {
-      redHint.textContent = "亮 " + red.lit + "/4 · 偏离 · 高低比 · 高杠杆 · 外盘";
+      redHint.textContent = "亮 " + red.lit + " · 已知 " + (red.known == null ? 4 : red.known) + "/4 · 偏离 · 高低比 · 高杠杆 · 外盘";
     }
 
     const kType = el("kTypeBlock");
@@ -531,13 +567,14 @@
         chips.className = "layer-chips";
         (layer.items || []).forEach((it) => {
           const chip = document.createElement("span");
-          const isGap = it.status === "gap" || it.score == null;
-          const scCls = isGap ? "gap" : it.score < 0 ? "neg" : it.score > 0 ? "pos" : "flat";
+          const isInfo = it.status === "info";
+          const isGap = !isInfo && (it.status === "gap" || it.score == null);
+          const scCls = isGap || isInfo ? "gap" : it.score < 0 ? "neg" : it.score > 0 ? "pos" : "flat";
           chip.className = "q-badge " + scCls;
           chip.title = (it.note || "") + (it.rule ? "\n规则：" + it.rule : "");
           chip.textContent =
             (it.label || it.id) +
-            (isGap ? " ·缺" : " " + (it.score > 0 ? "+" + it.score : String(it.score)));
+            (isInfo ? " ·观察" : it.status === "stale" ? " ·陈旧" : it.status === "partial" ? " ·部分覆盖" : isGap ? " ·缺" : " " + (it.score > 0 ? "+" + it.score : String(it.score)));
           chips.appendChild(chip);
         });
         block.innerHTML =
@@ -557,7 +594,7 @@
     if (rules) {
       const monthRows = d.funds_month || [];
       const monthHtml = monthRows.length
-        ? "<table class=\"funds-month\"><thead><tr><th>月</th><th>主力净额</th><th>郭嘉队ETF份额变</th><th>融资余额变</th></tr></thead><tbody>" +
+        ? "<table class=\"funds-month\"><thead><tr><th>月</th><th>主力净额</th><th>宽基ETF份额变</th><th>融资余额变</th></tr></thead><tbody>" +
           monthRows.slice().reverse().map((r) => {
             const fmt = (v, unit) => v == null || !Number.isFinite(+v) ? "—" :
               ((+v > 0 ? "+" : "") + (+v).toFixed(unit === "份" ? 1 : 0));
@@ -671,7 +708,9 @@
     badges.forEach((b) => {
       const span = document.createElement("span");
       const st = b.stable;
-      span.className = "q-badge " + (st === true ? "ok" : st === false ? "warn" : "na");
+      const historical = b.source_status === "historical";
+      const partial = b.source_status === "partial";
+      span.className = "q-badge " + (historical ? "na" : partial ? "warn" : st === true ? "ok" : st === false ? "warn" : "na");
       const sk = idToSpanKey[b.id] || b.id;
       const rows = b.rows != null ? b.rows : cov[sk];
       const range = fmtSpan(spans[sk]);
@@ -680,7 +719,7 @@
       span.textContent =
         b.label +
         (range ? " " + range : rows != null ? " " + rows : "") +
-        (st === true ? " ✓" : st === false ? " !" : "");
+        (historical ? " ·历史" : partial ? " ·部分覆盖" : st === true ? " ✓" : st === false ? " !" : "");
       host.appendChild(span);
     });
     if (!badges.length) {
@@ -689,7 +728,7 @@
         ["mf_month", "月主力"],
         ["mf_week", "周主力"],
         ["northbound_week", "北向"],
-        ["etf", "郭嘉队ETF"],
+        ["etf", "宽基ETF"],
         ["margin", "两融"],
         ["growth_value", "偏离"],
         ["high_low", "广度"],
@@ -1275,7 +1314,7 @@
     );
     setPaneCoverage(
       "pane-etf",
-      "02 郭嘉队ETF 份额（亿份）· 旁证≠汇金",
+      "02 核心宽基ETF份额（亿份）· 不能识别持有人",
       "etf",
       data
     );
@@ -1385,7 +1424,7 @@
         etfLine.__dataCacheOv = etfCache;
         c0.__overlays = [
           { label: "融资", cache: mgCache },
-          { label: "郭嘉队ETF", cache: etfCache },
+          { label: "宽基ETF", cache: etfCache },
         ];
         state.weeklyOverlaySeries = { margin: mgLine, etf: etfLine };
         applyOverlayToggles();
@@ -1505,7 +1544,7 @@
     }
 
     const c2 = createChart("chart-etf", { showTimeAxis: false });
-    if (c2) c2.__label = "郭嘉队ETF";
+    if (c2) c2.__label = "宽基ETF";
     if (c2) {
       const etf = c2.addLineSeries({ color: "#f6bd16", lineWidth: 2 });
       const etfPts = padToAnchors(mapLine(etfRows, "value"), anchors, 10);
