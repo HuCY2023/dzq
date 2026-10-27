@@ -44,21 +44,15 @@ def load_holder_disclosures(*, as_of: Any | None = None, path: Path = DISCLOSURE
         items.append(current)
     verified = sum(row["status"] != "not_verified" for row in items)
     named = sum(row["status"] == "named_disclosure" for row in items)
-    selected = next(row for row in items if row["code"] == "159919")
-    display = f"已核验基金报告 {verified}/{len(CORE_CSI300)} 只。"
-    pdf_note = f"持有人报告已核验 {verified}/{len(CORE_CSI300)} 只。"
-    if selected["status"] == "not_disclosed":
-        prior = selected["last_named"]
-        prior_note = f"已核验的上期实名快照为 {prior['period_end']}，不能作为当前持仓。" if prior else ""
-        display += (f"159919 报告期 {selected['period_end']}，公告 {selected['published_date']}，"
-                    f"未披露实名持有人。{prior_note}")
-        pdf_note += f"159919 {selected['period_end']} 未列实名（公告 {selected['published_date']}），旧期非当前。"
-    elif selected["status"] == "named_disclosure":
-        display += (f"159919 报告期 {selected['period_end']}，公告 {selected['published_date']}，"
-                    f"汇金投资与汇金资管直接持有合计 {selected['direct_shares'] / 1e8:.2f} 亿份，属历史快照。")
-        pdf_note += f"159919 {selected['period_end']} 披露直接持有，属历史快照。"
-    else:
-        display += "尚未核验到当时可用的 159919 报告。"
+    display = (f"已核验基金报告 {verified}/{len(CORE_CSI300)} 只；未披露不等于零，"
+               "历史快照不能作为当前持仓。")
+    pdf_note = f"持有人报告已核验 {verified}/{len(CORE_CSI300)} 只，旧期实名份额不是当前持仓。"
+    if verified == len(items) and all(row["status"] == "not_disclosed" for row in items):
+        periods = {row["period_end"] for row in items}
+        if len(periods) == 1:
+            published = sorted({row["published_date"] for row in items})
+            pdf_note = (f"持有人报告已核验 {verified}/{len(items)} 只：{periods.pop()} 均未列实名；"
+                        f"公告 {'、'.join(published)}，旧期非当前。")
     return {"status": "ok" if named == len(CORE_CSI300) else "partial", "as_of": cutoff.isoformat(),
             "coverage": {"verified_reports": verified, "named_latest_report": named, "expected": len(CORE_CSI300)},
             "items": items, "display": display, "pdf_note": pdf_note,
