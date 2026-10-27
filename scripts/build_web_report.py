@@ -57,7 +57,7 @@ def _save_inputs(run_dir: Path, bundle: dict, share_events: bytes | None, holder
         value = bundle.get(name)
         if isinstance(value, pd.DataFrame):
             value.to_csv(root / f"{name}.csv", index=False, encoding="utf-8-sig")
-    for name in ("trade_calendar", "us_crowding", "etf_flow", "etf_holder_disclosures"):
+    for name in ("trade_calendar", "us_crowding", "etf_flow", "etf_holder_disclosures", "turnover_observation"):
         value = bundle.get(name)
         if isinstance(value, dict):
             (root / f"{name}.json").write_text(json.dumps(value, ensure_ascii=False, default=str), encoding="utf-8")
@@ -69,6 +69,14 @@ def _save_inputs(run_dir: Path, bundle: dict, share_events: bytes | None, holder
                      "trade_calendar_source.csv", "index_crosscheck_source.csv"):
             if (snapshot / name).is_file():
                 target = root / "etf_flow" / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(snapshot / name, target)
+    turnover = bundle.get("turnover_observation") or {}
+    if turnover.get("snapshot"):
+        snapshot = Path(turnover["snapshot"])
+        for name in ("observation.json", "source_summary.json", "latest-top5.csv"):
+            if (snapshot / name).is_file():
+                target = root / "turnover" / name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(snapshot / name, target)
 
@@ -218,7 +226,8 @@ def main() -> int:
         "quality": payload.get("quality") or {},
         "parameters": {"refresh": args.refresh, "pdf": args.pdf},
         "sources": {"trade_calendar": meta.get("trade_calendar"), "us_crowding": meta.get("us_crowding"),
-                    "etf_flow": bundle.get("etf_flow"), "etf_holder_disclosures": bundle.get("etf_holder_disclosures")},
+                    "etf_flow": bundle.get("etf_flow"), "etf_holder_disclosures": bundle.get("etf_holder_disclosures"),
+                    "turnover_observation": bundle.get("turnover_observation")},
         "diagnosis": diagnosis,
         "artifacts": {"web": str(archived_web / "index.html"), "pdf": str(pdf) if pdf else None,
                       "payload": str(run_dir / "payload.json"), "inputs": str(run_dir / "inputs"),
