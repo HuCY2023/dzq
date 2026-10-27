@@ -33,17 +33,27 @@ def main() -> int:
         refresh=args.refresh,
         skip_high_low=True,
     )
+    weekly = (bundle.get("meta") or {}).get("weekly") or {}
+    if not weekly.get("ok"):
+        print(weekly.get("error") or f"{args.index} 周线不可用，未生成报告。", file=sys.stderr)
+        return 1
     payload = bundle_to_web_payload(bundle, index_label=label)
     snap = write_web_snapshot(payload, index_symbol=args.index)
     print("web_snapshot:", snap)
 
     if args.pdf:
-        from data_source.dp_cycle.long_term_pdf import build_long_term_pdf
-        from output_paths import dp_cycle_dir
+        from data_source.dp_cycle.pipeline import run_dp_cycle_pipeline
 
-        out = Path(dp_cycle_dir()) / "大周期五项指标_长期跟踪.pdf"
-        path = build_long_term_pdf(bundle, str(out))
-        print("pdf:", path)
+        result = run_dp_cycle_pipeline(
+            index_symbol=args.index, refresh_db=False,
+            bundle=bundle, diagnosis=payload.get("diagnosis"),
+        )
+        print("pdf:", result["pdf"])
+    ingest = (bundle.get("meta") or {}).get("ingest") or {}
+    if args.refresh and not ingest.get("ok"):
+        failed = [key for key, value in ingest.items() if isinstance(value, dict) and value.get("ok") is False]
+        print("更新未全部完成；已生成的报告可能沿用缓存：" + "、".join(failed), file=sys.stderr)
+        return 2
     return 0
 
 
