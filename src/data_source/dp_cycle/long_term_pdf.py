@@ -267,7 +267,8 @@ def _position_page(pdf: PdfPages, *, as_of: str, diagnosis: dict[str, Any], page
     _page(fig, pdf)
 
 
-def _method_page(pdf: PdfPages, *, as_of: str, page: int, total: int, rule_version: str = "improved_v1") -> None:
+def _method_page(pdf: PdfPages, *, as_of: str, page: int, total: int, rule_version: str = "improved_v1",
+                 holder_note: str = "") -> None:
     fig = plt.figure(figsize=PAGE)
     ax = fig.add_axes([0.06, 0.08, 0.88, 0.86])
     ax.axis("off")
@@ -293,6 +294,8 @@ def _method_page(pdf: PdfPages, *, as_of: str, page: int, total: int, rule_versi
         "免责声明：",
         DISCLAIMER_BODY_CN,
     ]
+    if holder_note:
+        lines.insert(2, holder_note)
     y = 0.92
     for line in lines:
         ax.text(0.0, y, line, fontsize=9, color="#333", transform=ax.transAxes, va="top")
@@ -427,7 +430,8 @@ def build_long_term_pdf(
                 total=total,
             )
         _method_page(pdf, as_of=str(as_of), page=total, total=total,
-                     rule_version=diagnosis.get("rule_version") or "improved_v1")
+                     rule_version=diagnosis.get("rule_version") or "improved_v1",
+                     holder_note=(tables.get("etf_holder_disclosures") or {}).get("pdf_note", ""))
 
     if latest_copy:
         os.makedirs(os.path.dirname(latest_copy) or ".", exist_ok=True)

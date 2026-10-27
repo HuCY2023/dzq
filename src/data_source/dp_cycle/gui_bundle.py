@@ -239,11 +239,13 @@ def load_dp_cycle_gui_bundle(
     from pathlib import Path
     from output_paths import dp_cycle_store_dir
     from data_source.dp_cycle.etf_flow import load_latest_etf_flow_snapshot
+    from data_source.dp_cycle.holder_disclosures import load_holder_disclosures
     from data_source.dp_cycle.margin import _margin_local_timestamp
 
     etf_flow = load_latest_etf_flow_snapshot(
         Path(dp_cycle_store_dir()) / "etf_flow_imports", as_of=_margin_local_timestamp(meta["as_of"]),
     )
+    etf_holder_disclosures = load_holder_disclosures(as_of=meta["as_of"])
 
     # 流动性节点监控数据（按需获取，不阻塞主流程）
     # 在 _switch_view("liquidity") 时单独获取
@@ -260,6 +262,7 @@ def load_dp_cycle_gui_bundle(
         "etf_hist": etf_hist,
         "etf_hist_adjusted": etf_hist_adjusted,
         "etf_flow": etf_flow,
+        "etf_holder_disclosures": etf_holder_disclosures,
         "trade_calendar": trade_calendar,
         "margin": tables.get("margin", pd.DataFrame()),
         "growth_value": tables.get("growth_value", pd.DataFrame()),
@@ -289,6 +292,11 @@ def _clip_bundle_as_of(bundle: dict[str, Any], as_of: date | str) -> dict[str, A
 
     cutoff = _margin_local_timestamp(as_of).normalize()
     clipped = dict(bundle)
+    disclosures = clipped.get("etf_holder_disclosures")
+    if isinstance(disclosures, dict) and disclosures.get("as_of") != cutoff.date().isoformat():
+        from data_source.dp_cycle.holder_disclosures import load_holder_disclosures
+
+        clipped["etf_holder_disclosures"] = load_holder_disclosures(as_of=cutoff)
     flow = clipped.get("etf_flow")
     if isinstance(flow, dict) and flow.get("date"):
         flow_date = _margin_local_timestamp(flow["date"])
@@ -441,6 +449,7 @@ def _other_dependency_mtimes() -> dict[str, int]:
     paths = {
         "trade_calendar": Path(dp_cycle_store_dir()) / "trade_calendar.csv",
         "etf_events": Path(__file__).resolve().parents[3] / "research" / "DP" / "data" / "etf_share_events.csv",
+        "etf_holder_disclosures": Path(__file__).resolve().parents[3] / "research" / "DP" / "data" / "etf_holder_disclosures.csv",
     }
     result: dict[str, int] = {}
     for name, path in paths.items():
@@ -868,6 +877,7 @@ def bundle_to_web_payload(
         "author_week_line": -2000.0,
         "etf": etf_rows,
         "etf_flow": bundle.get("etf_flow"),
+        "etf_holder_disclosures": bundle.get("etf_holder_disclosures"),
         "margin": margin_rows,
         "growth_value": gv_rows,
         "high_low": hl_rows,
