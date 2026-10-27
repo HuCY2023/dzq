@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SHARE_EVENTS_PATH = ROOT / "research" / "DP" / "data" / "etf_share_events.csv"
+HOLDER_DISCLOSURES_PATH = ROOT / "research" / "DP" / "data" / "etf_holder_disclosures.csv"
 for p in (ROOT, ROOT / "src"):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
@@ -40,7 +41,7 @@ def _read_share_events() -> bytes | None:
         return None
 
 
-def _save_inputs(run_dir: Path, bundle: dict, share_events: bytes | None) -> None:
+def _save_inputs(run_dir: Path, bundle: dict, share_events: bytes | None, holder_disclosures: bytes) -> None:
     """保留生成时使用的输入，而不触碰用户原始缓存。"""
     import pandas as pd
 
@@ -48,6 +49,7 @@ def _save_inputs(run_dir: Path, bundle: dict, share_events: bytes | None) -> Non
     root.mkdir()
     if share_events is not None:
         (root / "etf_share_events.csv").write_bytes(share_events)
+    (root / "etf_holder_disclosures.csv").write_bytes(holder_disclosures)
     for name in ("weekly", "main_force_daily", "main_force_weekly", "main_force_monthly",
                  "northbound_daily", "etf_hist", "etf_hist_adjusted", "etf_daily", "etf_monthly",
                  "margin", "growth_value", "high_low", "unlock_daily",
@@ -55,7 +57,7 @@ def _save_inputs(run_dir: Path, bundle: dict, share_events: bytes | None) -> Non
         value = bundle.get(name)
         if isinstance(value, pd.DataFrame):
             value.to_csv(root / f"{name}.csv", index=False, encoding="utf-8-sig")
-    for name in ("trade_calendar", "us_crowding", "etf_flow"):
+    for name in ("trade_calendar", "us_crowding", "etf_flow", "etf_holder_disclosures"):
         value = bundle.get(name)
         if isinstance(value, dict):
             (root / f"{name}.json").write_text(json.dumps(value, ensure_ascii=False, default=str), encoding="utf-8")
@@ -161,6 +163,7 @@ def main() -> int:
 
     label = next((k for k, v in INDEX_CHOICES.items() if v == args.index), args.index)
     share_events = _read_share_events()
+    holder_disclosures = HOLDER_DISCLOSURES_PATH.read_bytes()
     bundle = load_dp_cycle_gui_bundle(
         index_symbol=args.index,
         refresh=args.refresh,
@@ -178,11 +181,13 @@ def main() -> int:
     payload = bundle_to_web_payload(bundle, index_label=label, rule_version=args.rule_version)
     if _read_share_events() != share_events:
         raise RuntimeError("ETF 份额事件表在报告生成期间发生变化，请重新生成报告")
+    if HOLDER_DISCLOSURES_PATH.read_bytes() != holder_disclosures:
+        raise RuntimeError("持有人披露表在报告生成期间发生变化，请重新生成报告")
     diagnosis = payload.get("diagnosis") or {}
     dated = Path(dp_cycle_dir())
     store = Path(dp_cycle_store_dir())
     run_dir = _new_run_dir(dated)
-    _save_inputs(run_dir, bundle, share_events)
+    _save_inputs(run_dir, bundle, share_events, holder_disclosures)
     (run_dir / "payload.json").write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
     archived_web = run_dir / "web_snapshot"
     snap = write_web_snapshot(payload, index_symbol=args.index, output_dir=archived_web)
@@ -213,11 +218,12 @@ def main() -> int:
         "quality": payload.get("quality") or {},
         "parameters": {"refresh": args.refresh, "pdf": args.pdf},
         "sources": {"trade_calendar": meta.get("trade_calendar"), "us_crowding": meta.get("us_crowding"),
-                    "etf_flow": bundle.get("etf_flow")},
+                    "etf_flow": bundle.get("etf_flow"), "etf_holder_disclosures": bundle.get("etf_holder_disclosures")},
         "diagnosis": diagnosis,
         "artifacts": {"web": str(archived_web / "index.html"), "pdf": str(pdf) if pdf else None,
                       "payload": str(run_dir / "payload.json"), "inputs": str(run_dir / "inputs"),
                       "etf_share_events": str(run_dir / "inputs" / "etf_share_events.csv") if share_events is not None else None,
+                      "etf_holder_disclosures": str(run_dir / "inputs" / "etf_holder_disclosures.csv"),
                       "latest_web": str(store / "web_snapshot" / "index.html"),
                       "latest_pdf": str(store / "大周期五项指标_长期跟踪.pdf") if pdf else None},
     }
