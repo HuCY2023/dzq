@@ -11,7 +11,7 @@ import pandas as pd
 DEFAULT_ONE_WAY_COST = 0.0005
 _OMISSIONS = [
     "平均股票暴露匹配使用整个评估期的事后结果，只是描述性对照。",
-    "递进分区、隔离期、预警标签和单项消融尚未实现，不能视为完整有效性验证。",
+    "分区外样本评价、预警标签和单项消融尚未实现，不能视为完整有效性验证。",
     "来源和复权凭证由调用方提供，程序不独立认证其真实性。",
     "可成交状态由输入提供，按连续份额计算，未单独模拟整手、涨跌停、滑点及成交容量。",
 ]
@@ -151,6 +151,39 @@ def _baseline_signals(prices: pd.DataFrame) -> dict[str, pd.DataFrame]:
             target = min(1.0, 0.15 / volatility) if volatility > 0 else 1.0
             rows["volatility_20"].append({"signal_at": timestamp, "available_at": timestamp, "target_equity": target})
     return {name: pd.DataFrame(items) for name, items in rows.items()}
+
+
+def purged_time_split(
+    trading_dates: Iterable[Any], *, train_end: Any, validation_end: Any,
+    test_end: Any | None = None, label_horizon: int = 60,
+) -> dict[str, Any]:
+    """按固定边界划分标签样本；标签终点不能跨越所属分区。"""
+    days = pd.DatetimeIndex(pd.to_datetime(list(trading_dates), errors="coerce")).normalize()
+    if days.empty or days.isna().any() or days.has_duplicates or not days.is_monotonic_increasing:
+        raise ValueError("交易日历必须按日期排序且无重复")
+    if not isinstance(label_horizon, int) or label_horizon <= 0:
+        raise ValueError("标签间隔必须是正整数")
+    train, validation = pd.Timestamp(train_end).normalize(), pd.Timestamp(validation_end).normalize()
+    test = pd.Timestamp(test_end).normalize() if test_end is not None else days[-1]
+    if pd.isna(train) or pd.isna(validation) or pd.isna(test) or not train < validation < test:
+        raise ValueError("训练、验证、测试边界必须依次递增")
+    visible = days[days <= test]
+    partitions: dict[str, list[dict[str, str]]] = {"train": [], "validation": [], "test": []}
+    excluded = 0
+    for i, day in enumerate(visible):
+        name, end = (("train", train) if day <= train else
+                     ("validation", validation) if day <= validation else ("test", test))
+        if i + label_horizon >= len(visible) or visible[i + label_horizon] > end:
+            excluded += 1
+            continue
+        partitions[name].append({"signal_date": day.date().isoformat(),
+                                 "label_end": visible[i + label_horizon].date().isoformat()})
+    complete = test <= days[-1] and all(partitions.values())
+    return {"status": "OK" if complete else "DATA_PARTIAL", "label_horizon": label_horizon,
+            "boundaries": {"train_end": train.date().isoformat(), "validation_end": validation.date().isoformat(),
+                           "test_end": test.date().isoformat()},
+            "partitions": partitions, "excluded_count": excluded,
+            "note": "仅按交易日生成候选日期和标签边界，不代表当日已有信号；不能替代历史版本核验或分区外评价。"}
 
 
 def evaluate_allocation(
