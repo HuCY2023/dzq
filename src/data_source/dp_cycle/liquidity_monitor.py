@@ -93,12 +93,8 @@ def _fetch_fred(series_id: str, start: str = DATA_START) -> pd.DataFrame:
     try:
         resp = requests.get(url, timeout=20)
         resp.raise_for_status()
-        df = pd.read_csv(
-            io.StringIO(resp.text),
-            skiprows=12,
-            header=None,
-            names=["date", "value"],
-        )
+        df = pd.read_csv(io.StringIO(resp.text), usecols=["observation_date", series_id])
+        df = df.rename(columns={"observation_date": "date", series_id: "value"})
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
         df = df.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)

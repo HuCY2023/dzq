@@ -34,6 +34,8 @@ def run_dp_cycle_pipeline(
     refresh_db: bool = True,
     skip_high_low: bool = False,
     index_symbol: str = DEFAULT_WEEKLY_INDEX,
+    bundle: dict[str, Any] | None = None,
+    diagnosis: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """更新/读取库 → 落盘图表与长期跟踪 PDF。"""
     del margin_lookback_years
@@ -42,14 +44,15 @@ def run_dp_cycle_pipeline(
     out = out_dir or dp_cycle_dir(for_date)
     os.makedirs(out, exist_ok=True)
 
-    bundle = load_dp_cycle_gui_bundle(
-        index_symbol=index_symbol,
-        high_low_start=high_low_start,
-        as_of=for_date,
-        refresh=refresh_db,
-        skip_high_low=skip_high_low,
-        mode="pipeline",
-    )
+    if bundle is None:
+        bundle = load_dp_cycle_gui_bundle(
+            index_symbol=index_symbol,
+            high_low_start=high_low_start,
+            as_of=for_date,
+            refresh=refresh_db,
+            skip_high_low=skip_high_low,
+            mode="pipeline",
+        )
     meta: dict[str, Any] = {
         "out_dir": out,
         "history_start": HISTORY_START_STR,
@@ -73,7 +76,7 @@ def run_dp_cycle_pipeline(
     etf_m = bundle.get("etf_monthly", pd.DataFrame())
     _save_csv(etf_hist, os.path.join(out, "02_etf_shares_daily.csv"))
     _save_csv(etf_m, os.path.join(out, "02_etf_shares_monthly.csv"))
-    p = report.plot_national_team(etf_hist, etf_m, os.path.join(out, "02_national_team.png"))
+    p = report.plot_national_team(bundle.get("etf_hist_adjusted", pd.DataFrame()), etf_m, os.path.join(out, "02_national_team.png"))
     if p:
         png_map["02_national_team"] = p
 
@@ -103,10 +106,19 @@ def run_dp_cycle_pipeline(
     research_copy = os.path.join(project_root(), "research", "DP", "大周期五项指标_长期跟踪.pdf")
 
     # long_term_pdf 期望 indicators 为各 ok 字典
+    from data_source.dp_cycle.diagnosis import _etf_coverage
+
+    etf_coverage = (((diagnosis or {}).get("data_availability") or {}).get("national_team") or {}).get("coverage")
+    if not etf_coverage:
+        etf_coverage = _etf_coverage(etf_hist)
     pdf_meta = {
         "indicators": {
-            "01_main_force": {"ok": not mf_agg["daily"].empty, "today_净额_亿元": None},
-            "02_national_team": {"ok": not etf_hist.empty},
+            "01_main_force": {**(bundle.get("meta") or {}).get("01_main_force", {}), "today_净额_亿元": None},
+            "02_national_team": {
+                "ok": not etf_hist.empty,
+                "partial": not etf_coverage or etf_coverage.get("complete") is not True,
+                "coverage": etf_coverage,
+            },
             "03_margin": {
                 "ok": not margin.empty,
                 "last_date": str(margin["date"].iloc[-1])[:10] if not margin.empty else None,
@@ -135,21 +147,16 @@ def run_dp_cycle_pipeline(
         out_pdf=long_pdf,
         meta=pdf_meta,
         pngs=png_map,
-        tables={
-            "etf_daily": bundle.get("etf_daily", pd.DataFrame()),
-            "weekly": bundle.get("weekly", pd.DataFrame()),
-            "main_force_daily": bundle.get("main_force_daily", pd.DataFrame()),
-            "margin": bundle.get("margin", pd.DataFrame()),
-            "growth_value": bundle.get("growth_value", pd.DataFrame()),
-            "high_low": bundle.get("high_low", pd.DataFrame()),
-            "unlock_daily": bundle.get("unlock_daily", pd.DataFrame()),
-        },
+        tables=bundle,
+        diagnosis=diagnosis,
         latest_copy=latest,
     )
     import shutil
 
     os.makedirs(os.path.dirname(research_copy), exist_ok=True)
-    shutil.copy2(long_path, research_copy)
+    # Preserve the reference PDF shipped with the repository.
+    if not os.path.exists(research_copy):
+        shutil.copy2(long_path, research_copy)
 
     meta["pngs"] = png_map
     meta["pdf"] = long_path

@@ -17,6 +17,7 @@ NT_PCT_HIGH = 75.0
 NT_PCT_LOW = 40.0
 NT_DELTA_FLAT = 5.0
 NT_SHORT_WINDOW = 36  # 近 N 月分轨窗口
+RULE_VERSIONS = {"improved_v1", "author_v1"}
 
 DIVERGENCE_EXTREME = 16.0
 HL_HOT_RATIO = 8.0
@@ -24,6 +25,11 @@ HL_COLD_RATIO = 0.2
 UNLOCK_HOT_MULT = 1.5
 MAIN_FORCE_WEEK_EXTREME = -2000.0
 SCISSORS_WEEK_EXTREME = -3000.0
+
+
+def validate_rule_version(rule_version: str) -> None:
+    if rule_version not in RULE_VERSIONS:
+        raise ValueError(f"未知规则版本: {rule_version}")
 
 
 def _zone(pct: float | None, high: float, low: float) -> str:
@@ -111,17 +117,19 @@ def decide_retail_action_core(
     margin_zone: str,
     margin_trend: str,
     behavior_bad: bool = False,
+    rule_version: str = "improved_v1",
 ) -> str | None:
     """硬信号 → 决策 id；返回 None 表示落到阶段默认。"""
-    if nt_zone == "high" and nt_trend == "out":
+    validate_rule_version(rule_version)
+    if rule_version == "author_v1" and nt_zone == "high" and nt_trend == "out":
         return "exit"
-    if nt_zone == "high" and nt_trend in {"in", "flat"}:
+    if rule_version == "author_v1" and nt_zone == "high" and nt_trend in {"in", "flat"}:
         return "reduce"
     if margin_zone == "high" and margin_trend == "up":
         return "exit" if score <= -3 or behavior_bad else "reduce"
     if margin_zone == "high" and margin_trend == "down":
         return "reduce"
-    if nt_zone == "low" and nt_trend == "in" and margin_zone in {"low", "mid", "gap"}:
+    if rule_version == "author_v1" and nt_zone == "low" and nt_trend == "in" and margin_zone in {"low", "mid", "gap"}:
         return "bottom"
     if margin_zone == "low" and margin_trend == "up" and score >= 2:
         return "add"
@@ -129,7 +137,7 @@ def decide_retail_action_core(
         return "exit"
     if score <= -2:
         return "reduce"
-    if score >= 3 and nt_zone == "low":
+    if rule_version == "author_v1" and score >= 3 and nt_zone == "low":
         return "bottom"
     if score >= 2:
         return "add"

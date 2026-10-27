@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import os
+import weakref
 from datetime import date, datetime
 from typing import Any, TYPE_CHECKING
 
@@ -27,8 +28,8 @@ def _duckdb():
 HISTORY_START = date(2015, 1, 1)
 HISTORY_START_STR = "2015-01-01"
 
-# init_schema 幂等但重复跑 DDL 有开销；用标记跳过同连接内的重复调用
-_schema_inited: set[int] = set()  # id(con) -> 已初始化
+# 连接对象释放后标记随之移除，避免新连接复用旧标识而跳过建表。
+_schema_inited: weakref.WeakSet = weakref.WeakSet()
 
 # 建议刷新粒度（说明用）：按源数据颗粒度，日/周/月均可，不强制统一月或季。
 # 实际以库内最新日期 + 源能取到的频率为准；慢变序列周更也完全合理。
@@ -92,10 +93,8 @@ def connect(*, read_only: bool = False, retries: int = 8, retry_delay: float = 0
 
 
 def init_schema(con: DuckDBPyConnection) -> None:
-    cid = id(con)
-    if cid in _schema_inited:
+    if con in _schema_inited:
         return
-    _schema_inited.add(cid)
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS meta_runs (
@@ -239,6 +238,7 @@ def init_schema(con: DuckDBPyConnection) -> None:
                 "INSERT INTO series_meta VALUES (?, ?, NULL, NULL, ?)",
                 [series, grain, "建议按颗粒度刷新（日/周/月均可）"],
             )
+    _schema_inited.add(con)
 
 
 def _migrate_high_low_source_key(con: DuckDBPyConnection) -> None:
@@ -568,18 +568,12 @@ def load_from_db(
                        sz_main_yi AS 深主板_亿元,
                        chinext_yi AS 创业板_亿元,
                        star_yi AS 科创板_亿元,
-                       (COALESCE(sh_main_yi, 0) + COALESCE(sz_main_yi, 0)) AS 主板_亿元,
-                       (COALESCE(sz_main_yi, 0) + COALESCE(chinext_yi, 0)) AS 深市_亿元
+                       (sh_main_yi + sz_main_yi) AS 主板_亿元,
+                       (sz_main_yi + chinext_yi) AS 深市_亿元
                 FROM margin_daily WHERE date >= ? ORDER BY date
                 """,
                 [start_ts],
             ).df()
-            # 无分板日：主板/深市置空，避免 COALESCE 把缺数写成 0
-            if not margin.empty and "沪主板_亿元" in margin.columns:
-                miss = margin["沪主板_亿元"].isna()
-                for col in ("主板_亿元", "深市_亿元"):
-                    if col in margin.columns:
-                        margin.loc[miss, col] = pd.NA
         except Exception:
             margin = con.execute(
                 """

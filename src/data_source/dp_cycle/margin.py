@@ -50,7 +50,7 @@ def _norm_exchange_pair(df: pd.DataFrame, tag: str) -> pd.DataFrame:
     if "融资融券余额" in out.columns:
         out[f"rzrq_{tag}"] = _to_yi(out["融资融券余额"])
     else:
-        out[f"rzrq_{tag}"] = out[f"rz_{tag}"]
+        out[f"rzrq_{tag}"] = float("nan")
     return out[["date", f"rz_{tag}", f"rzrq_{tag}"]].dropna(subset=["date"])
 
 
@@ -58,28 +58,41 @@ def _fetch_macro_sh_sz() -> tuple[pd.DataFrame, dict[str, Any]]:
     """AkShare 宏观表：沪 + 深（历史最长，作主存）。"""
     import akshare as ak
 
-    meta: dict[str, Any] = {"id": "macro_sh_sz", "ok": False, "error": None}
-    try:
-        sh = call_with_retry(ak.macro_china_market_margin_sh)
-        sz = call_with_retry(ak.macro_china_market_margin_sz)
-        a = _norm_exchange_pair(sh, "sh")
-        b = _norm_exchange_pair(sz, "sz")
-        m = pd.merge(a, b, on="date", how="outer").sort_values("date")
-        m["融资余额_亿元"] = m["rz_sh"].fillna(0) + m["rz_sz"].fillna(0)
-        m["两融余额_亿元"] = m["rzrq_sh"].fillna(0) + m["rzrq_sz"].fillna(0)
-        out = m[["date", "融资余额_亿元", "两融余额_亿元"]].dropna(subset=["融资余额_亿元"])
-        meta.update(
-            {
-                "ok": True,
-                "rows": int(len(out)),
-                "first_date": str(out["date"].iloc[0].date()) if len(out) else None,
-                "last_date": str(out["date"].iloc[-1].date()) if len(out) else None,
-            }
-        )
-        return out.reset_index(drop=True), meta
-    except Exception as exc:  # noqa: BLE001
-        meta["error"] = f"{type(exc).__name__}: {exc}"
-        return pd.DataFrame(columns=["date", "融资余额_亿元", "两融余额_亿元"]), meta
+    meta: dict[str, Any] = {"id": "macro_sh_sz", "ok": False, "error": None, "sources": {}}
+    frames = []
+    for tag, fetch in (("sh", ak.macro_china_market_margin_sh), ("sz", ak.macro_china_market_margin_sz)):
+        source: dict[str, Any] = {"ok": False, "rows": 0, "error": None}
+        try:
+            frame = _norm_exchange_pair(call_with_retry(fetch), tag)
+            source["rows"] = int(len(frame))
+            source["ok"] = bool(frame[f"rz_{tag}"].notna().any())
+            source["last_date"] = str(frame["date"].max().date()) if len(frame) else None
+            if not source["ok"]:
+                source["error"] = "empty"
+        except Exception as exc:  # noqa: BLE001
+            source["error"] = f"{type(exc).__name__}: {exc}"
+            frame = pd.DataFrame({"date": pd.Series(dtype="datetime64[ns]"),
+                                  f"rz_{tag}": pd.Series(dtype=float),
+                                  f"rzrq_{tag}": pd.Series(dtype=float)})
+        meta["sources"][tag] = source
+        frames.append(frame)
+    out = pd.merge(frames[0], frames[1], on="date", how="outer").sort_values("date")
+    out["融资余额_亿元"] = out["rz_sh"] + out["rz_sz"]
+    out["两融余额_亿元"] = out["rzrq_sh"] + out["rzrq_sz"]
+    valid = out.dropna(subset=["融资余额_亿元"])
+    partial = bool(len(out) and out[["融资余额_亿元", "两融余额_亿元"]].isna().any(axis=None))
+    errors = [f"{tag}: {source['error']}" for tag, source in meta["sources"].items() if source["error"]]
+    meta.update({
+        "ok": bool(len(out) and not partial and not errors),
+        "partial": partial,
+        "error": "; ".join(errors) if errors else None,
+        "rows": int(len(out)),
+        "complete_rows": int(out[["融资余额_亿元", "两融余额_亿元"]].notna().all(axis=1).sum()),
+        "first_date": str(valid["date"].iloc[0].date()) if len(valid) else None,
+        "last_date": str(valid["date"].iloc[-1].date()) if len(valid) else None,
+        "latest_raw_date": str(out["date"].iloc[-1].date()) if len(out) else None,
+    })
+    return out.reset_index(drop=True), meta
 
 
 def _fetch_sse_financing() -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -335,16 +348,20 @@ def fetch_margin_daily(*, cross_check: bool = True) -> tuple[pd.DataFrame, dict[
     meta: dict[str, Any] = {
         "source": "macro_china_market_margin_sh+sz",
         "ok": macro_meta.get("ok", False),
+        "partial": macro_meta.get("partial", False),
         "error": macro_meta.get("error"),
         "primary": macro_meta,
+        "last_date": macro_meta.get("last_date"),
+        "latest_raw_date": macro_meta.get("latest_raw_date"),
     }
     if not out.empty:
         meta["rows"] = int(len(out))
-        meta["last_date"] = str(out["date"].iloc[-1].date())
-        meta["last_融资余额_亿元"] = float(out["融资余额_亿元"].iloc[-1])
-    if cross_check and not out.empty:
+        value = out["融资余额_亿元"].iloc[-1]
+        meta["last_融资余额_亿元"] = float(value) if pd.notna(value) else None
+    complete = out.dropna(subset=["融资余额_亿元"])
+    if cross_check and not complete.empty:
         try:
-            meta["cross_check"] = cross_validate_margin(out)
+            meta["cross_check"] = cross_validate_margin(complete)
             meta["cross_check_stable"] = meta["cross_check"].get("stable")
         except Exception as exc:  # noqa: BLE001
             meta["cross_check"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -372,6 +389,7 @@ def enrich_margin(df: pd.DataFrame, *, lookback_years: int = 5) -> pd.DataFrame:
     for i in range(_n):
         li = int(_left_idx[i])
         win = _vals[li : i + 1]
+        win = win[~np.isnan(win)]
         if len(win) >= 5 and not np.isnan(_vals[i]):
             pct_n[i] = float((win <= _vals[i]).sum() / len(win) * 100.0)
     x["分位_近N年"] = pct_n
@@ -400,42 +418,32 @@ def classify_margin_code(code: Any) -> str:
     return "other"
 
 
-def _board_empty_row(day: pd.Timestamp) -> dict[str, Any]:
-    return {
-        "date": pd.Timestamp(day).normalize(),
-        "沪主板_亿元": float("nan"),
-        "深主板_亿元": float("nan"),
-        "创业板_亿元": float("nan"),
-        "科创板_亿元": float("nan"),
-        "主板_亿元": float("nan"),
-        "深市_亿元": float("nan"),
-    }
-
-
 def aggregate_margin_boards_from_details(
     sse: pd.DataFrame | None, szse: pd.DataFrame | None, *, day: pd.Timestamp
 ) -> dict[str, Any]:
     """把沪/深个股明细汇总成板余额（亿元）。不含 ETF 等 other。"""
-    buckets = {"sh_main": 0.0, "sz_main": 0.0, "chinext": 0.0, "star": 0.0}
-    n = 0
-    if sse is not None and not sse.empty:
-        code_col = "标的证券代码" if "标的证券代码" in sse.columns else sse.columns[1]
-        ye_col = "融资余额" if "融资余额" in sse.columns else None
-        if ye_col:
-            codes = sse[code_col].map(classify_margin_code)
-            ye = pd.to_numeric(sse[ye_col], errors="coerce").fillna(0.0)
-            for key in buckets:
-                buckets[key] += float(ye[codes == key].sum())
-            n += int(len(sse))
-    if szse is not None and not szse.empty:
-        code_col = "证券代码" if "证券代码" in szse.columns else szse.columns[0]
-        ye_col = "融资余额" if "融资余额" in szse.columns else None
-        if ye_col:
-            codes = szse[code_col].map(classify_margin_code)
-            ye = pd.to_numeric(szse[ye_col], errors="coerce").fillna(0.0)
-            for key in buckets:
-                buckets[key] += float(ye[codes == key].sum())
-            n += int(len(szse))
+    buckets = {key: float("nan") for key in ("sh_main", "sz_main", "chinext", "star")}
+    counts = {"sse": 0, "szse": 0}
+    for name, data, code_name, code_index, keys in (
+        ("sse", sse, "标的证券代码", 1, ("sh_main", "star")),
+        ("szse", szse, "证券代码", 0, ("sz_main", "chinext")),
+    ):
+        if data is None or data.empty or "融资余额" not in data.columns:
+            continue
+        if code_name in data.columns:
+            code_col = code_name
+        elif len(data.columns) > code_index:
+            code_col = data.columns[code_index]
+        else:
+            continue
+        codes = data[code_col].map(classify_margin_code)
+        ye = pd.to_numeric(data["融资余额"], errors="coerce")
+        if not ye.notna().any():
+            continue
+        counts[name] = int(len(data))
+        for key in keys:
+            values = ye[codes == key]
+            buckets[key] = float(values.sum(min_count=len(values))) if len(values) else 0.0
     # 交易所明细单位为元
     sh_m = buckets["sh_main"] / 1e8
     sz_m = buckets["sz_main"] / 1e8
@@ -449,7 +457,9 @@ def aggregate_margin_boards_from_details(
         "科创板_亿元": star,
         "主板_亿元": sh_m + sz_m,
         "深市_亿元": sz_m + cx,
-        "_detail_n": n,
+        "_detail_n": counts["sse"] + counts["szse"],
+        "_sse_n": counts["sse"],
+        "_szse_n": counts["szse"],
     }
 
 
@@ -459,22 +469,28 @@ def fetch_margin_boards_one_day(day: pd.Timestamp | str) -> dict[str, Any]:
 
     ts = pd.Timestamp(day).normalize()
     d = ts.strftime("%Y%m%d")
+    errors = {}
     try:
         sse = call_with_retry(ak.stock_margin_detail_sse, date=d, retries=2, delay=1.0)
     except Exception as exc:  # noqa: BLE001
         logger.warning("margin boards SSE %s: %s", d, exc)
+        errors["sse"] = f"{type(exc).__name__}: {exc}"
         sse = pd.DataFrame()
     try:
         szse = call_with_retry(ak.stock_margin_detail_szse, date=d, retries=2, delay=1.0)
     except Exception as exc:  # noqa: BLE001
         logger.warning("margin boards SZSE %s: %s", d, exc)
+        errors["szse"] = f"{type(exc).__name__}: {exc}"
         szse = pd.DataFrame()
-    if (sse is None or sse.empty) and (szse is None or szse.empty):
-        row = _board_empty_row(ts)
-        row["ok"] = False
-        return row
     row = aggregate_margin_boards_from_details(sse, szse, day=ts)
-    row["ok"] = True
+    for name, columns in (("sse", ("沪主板_亿元", "科创板_亿元")),
+                          ("szse", ("深主板_亿元", "创业板_亿元"))):
+        if any(pd.isna(row[column]) for column in columns) and name not in errors:
+            errors[name] = "incomplete financing data" if row[f"_{name}_n"] else "empty or missing financing data"
+    atomic = [row[name] for name in ("沪主板_亿元", "深主板_亿元", "创业板_亿元", "科创板_亿元")]
+    row["ok"] = all(pd.notna(value) for value in atomic)
+    row["partial"] = any(pd.notna(value) for value in atomic) and not row["ok"]
+    row["errors"] = errors
     return row
 
 
@@ -508,7 +524,7 @@ def fetch_margin_boards_for_dates(
     sleep_s: float = 0.35,
     progress_cb: Any | None = None,
 ) -> pd.DataFrame:
-    """批量拉分板；失败日跳过（不写 NaN 行，留给下次补）。"""
+    """批量拉分板；保留部分结果和失败信息，缺失列下次继续补。"""
     cols = [
         "date",
         "沪主板_亿元",
@@ -517,6 +533,12 @@ def fetch_margin_boards_for_dates(
         "科创板_亿元",
         "主板_亿元",
         "深市_亿元",
+        "_detail_n",
+        "_sse_n",
+        "_szse_n",
+        "ok",
+        "partial",
+        "errors",
     ]
     rows: list[dict[str, Any]] = []
     uniq = sorted({pd.Timestamp(d).normalize() for d in dates if pd.notna(d)})
@@ -532,8 +554,7 @@ def fetch_margin_boards_for_dates(
             except Exception:
                 pass
         row = fetch_margin_boards_one_day(day)
-        if row.get("ok"):
-            rows.append({k: row[k] for k in cols})
+        rows.append({k: row[k] for k in cols})
         if sleep_s > 0 and i + 1 < len(uniq):
             time.sleep(sleep_s)
     if not rows:

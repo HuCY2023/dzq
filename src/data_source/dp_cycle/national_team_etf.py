@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -185,17 +186,46 @@ def backfill_core_etf_month_ends(*, months: int = 24) -> tuple[pd.DataFrame, dic
     return hist.reset_index(drop=True), meta
 
 
+def adjust_share_events(hist: pd.DataFrame) -> pd.DataFrame:
+    """保留原始份额，新增按已发生份额事件折算的亿份列。"""
+    h = hist.copy()
+    if hist.empty:
+        return h
+    h["date"] = pd.to_datetime(h["date"])
+    h["份额_调整后_亿份"] = pd.to_numeric(h["份额_亿份"], errors="coerce")
+    if "code" in h.columns:
+        event_path = Path(__file__).resolve().parents[3] / "research" / "DP" / "data" / "etf_share_events.csv"
+        events = pd.read_csv(event_path, dtype={"code": str}, parse_dates=["event_date"])
+        codes = h["code"].astype(str).str.zfill(6)
+        for event in events.itertuples(index=False):
+            if event.event_date <= h["date"].max():
+                mask = (codes == event.code) & (h["date"] < event.event_date)
+                if mask.any():
+                    h["份额_调整后_亿份"] = h["份额_调整后_亿份"].astype(float)
+                    h.loc[mask, "份额_调整后_亿份"] *= event.ratio
+    return h
+
+
 def monthly_share_change(hist: pd.DataFrame) -> pd.DataFrame:
-    """月末份额合计与月变动（亿份）。"""
+    """月末份额合计与月变动（亿份）；已发生的份额事件按基金折算。"""
     if hist.empty:
         return pd.DataFrame()
-    h = hist.copy()
-    h["date"] = pd.to_datetime(h["date"])
+    h = adjust_share_events(hist)
     # 每日核心合计
-    daily = h.groupby("date", as_index=False)["份额_亿份"].sum()
+    daily = h.groupby("date", as_index=False)["份额_调整后_亿份"].sum(min_count=1).rename(
+        columns={"份额_调整后_亿份": "份额_亿份"}
+    )
     daily = daily.sort_values("date")
     daily["month"] = daily["date"].dt.to_period("M")
     month_end = daily.groupby("month", as_index=False).tail(1).copy()
     month_end["月变动_亿份"] = month_end["份额_亿份"].diff()
+    month_number = month_end["month"].dt.year * 12 + month_end["month"].dt.month
+    comparable = month_number.diff().eq(1)
+    if "code" in h.columns:
+        valid = h.dropna(subset=["code", "份额_调整后_亿份"])
+        members = valid.groupby("date")["code"].agg(lambda values: tuple(sorted(set(values.astype(str).str.zfill(6)))))
+        snapshots = month_end["date"].map(members)
+        comparable &= snapshots.notna() & snapshots.eq(snapshots.shift())
+    month_end.loc[~comparable, "月变动_亿份"] = float("nan")
     month_end["month_start"] = month_end["month"].dt.to_timestamp()
     return month_end.reset_index(drop=True)

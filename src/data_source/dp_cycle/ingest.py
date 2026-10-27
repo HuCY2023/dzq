@@ -58,25 +58,29 @@ def ingest_main_force(con, *, as_of: date | None = None) -> dict[str, Any]:
 
     del as_of
     daily, meta = fetch_em_market_fund_flow()
+    raw_last = _last(daily)
+    meta["latest_raw_date"] = str(raw_last.date()) if raw_last is not None and not pd.isna(raw_last) else None
+    if not daily.empty:
+        daily = daily.copy()
+        daily["source"] = "em_market_main"
     cache_json = os.path.join(dp_cycle_store_dir(), "_em_fflow_raw.json")
     cache_csv = os.path.join(dp_cycle_store_dir(), "main_force_ths", "em_market_daily.csv")
-    cached = load_em_fund_flow_cache(cache_json)
-    if cached.empty:
-        cached = load_em_fund_flow_cache(cache_csv)
-    try:
-        stored = con.execute(
-            """
-            SELECT date, net_yi AS 净额_亿元, inflow_yi AS 流入_亿元,
-                   outflow_yi AS 流出_亿元, industry_n AS 行业数, source
-            FROM main_force_daily
-            """
-        ).df()
-    except Exception:
-        stored = pd.DataFrame()
+    cached_json = load_em_fund_flow_cache(cache_json)
+    cached_csv = load_em_fund_flow_cache(cache_csv)
+    init_schema(con)
+    stored = con.execute(
+        """
+        SELECT date, net_yi AS 净额_亿元, inflow_yi AS 流入_亿元,
+               outflow_yi AS 流出_亿元, industry_n AS 行业数, source,
+               small_yi AS 小单_亿元, mid_yi AS 中单_亿元,
+               large_yi AS 大单_亿元, super_yi AS 超大单_亿元
+        FROM main_force_daily
+        """
+    ).df()
     from data_source.dp_cycle.main_force_em import union_main_force_frames
 
     # 缓存、库内、本次拉取按日期并集；短响应不能把更长历史盖掉
-    daily = union_main_force_frames(cached, stored, daily)
+    daily = union_main_force_frames(cached_json, cached_csv, stored, daily)
     if not daily.empty and not meta.get("ok"):
         meta = {
             **meta,
@@ -93,20 +97,31 @@ def ingest_main_force(con, *, as_of: date | None = None) -> dict[str, Any]:
 
         daily, ths_meta = upsert_today_from_ths()
         meta = {**meta, "ths_fallback": ths_meta}
-        source = "ths_industry_sum"
-    else:
-        source = "em_market_main"
+        daily = daily.copy()
+        daily["source"] = "ths_industry_sum"
 
     daily = clip_from_2015(daily)
     if daily.empty:
+        meta["last_date"] = None
         return {**meta, "wrote": 0}
+    net = pd.to_numeric(daily["净额_亿元"], errors="coerce")
+    last_net_date = _last(daily.loc[net.notna()])
+    meta["last_date"] = str(last_net_date.date()) if last_net_date is not None else None
+    meta["missing_net_rows"] = int(net.isna().sum())
+    meta["partial"] = meta["missing_net_rows"] > 0
+    if meta["partial"]:
+        meta["ok"] = False
+    source = " | ".join(dict.fromkeys(
+        name for value in daily["source"] for name in str(value).split(" | ")
+    ))
 
     # 落盘 CSV 便于离线
     try:
         store = os.path.join(dp_cycle_store_dir(), "main_force_ths")
         os.makedirs(store, exist_ok=True)
         path = os.path.join(store, "em_market_daily.csv")
-        keep_cols = [c for c in ("date", "净额_亿元", "流入_亿元", "流出_亿元", "行业数") if c in daily.columns]
+        keep_cols = [c for c in ("date", "净额_亿元", "小单_亿元", "中单_亿元", "大单_亿元", "超大单_亿元",
+                                  "流入_亿元", "流出_亿元", "行业数", "source") if c in daily.columns]
         daily[keep_cols].to_csv(path, index=False, encoding="utf-8-sig")
     except Exception:
         pass
@@ -125,7 +140,7 @@ def ingest_main_force(con, *, as_of: date | None = None) -> dict[str, Any]:
             "industry_n": pd.to_numeric(daily.get("行业数"), errors="coerce").astype("Int64")
             if "行业数" in daily.columns
             else pd.NA,
-            "source": source,
+            "source": daily["source"],
             "small_yi": _num("小单_亿元"),
             "mid_yi": _num("中单_亿元"),
             "large_yi": _num("大单_亿元"),
@@ -133,7 +148,8 @@ def ingest_main_force(con, *, as_of: date | None = None) -> dict[str, Any]:
         }
     )
     n = upsert_dataframe(con, "main_force_daily", out, key_cols=["date"])
-    touch_series(con, "main_force_daily", last_date=_last(daily), note=source)
+    note = f"{source}; 净额缺失 {meta['missing_net_rows']} 日" if meta["partial"] else source
+    touch_series(con, "main_force_daily", last_date=last_net_date, note=note)
     meta["wrote"] = n
     meta["source"] = source
     return meta
@@ -194,37 +210,65 @@ def ingest_margin(
 
     _p("融资：拉沪深合计…", 1, 3)
     raw, meta = fetch_margin_daily(cross_check=cross_check)
-    enriched = enrich_margin(raw, lookback_years=lookback_years)
-    enriched = clip_from_2015(enriched)
-    if enriched.empty:
+    if raw.empty:
         return {**meta, "wrote": 0}
 
-    # 保留库内已有分板，避免全量重拉
-    have_boards = pd.DataFrame(columns=["date", "sh_main_yi", "sz_main_yi", "chinext_yi", "star_yi"])
+    # 缺侧时保留已有总额和分板；新增日期的缺失值仍为空。
+    atomics = ["sh_main_yi", "sz_main_yi", "chinext_yi", "star_yi"]
+    existing = pd.DataFrame(columns=["date", "financing_yi", "margin_total_yi", *atomics])
     try:
-        have_boards = con.execute(
+        existing = con.execute(
             """
-            SELECT date, sh_main_yi, sz_main_yi, chinext_yi, star_yi
+            SELECT date, financing_yi, margin_total_yi, sh_main_yi, sz_main_yi, chinext_yi, star_yi
             FROM margin_daily
-            WHERE sh_main_yi IS NOT NULL
             """
         ).df()
     except Exception:
         pass
+    raw = raw.copy()
+    if not existing.empty:
+        existing["date"] = pd.to_datetime(existing["date"]).dt.normalize()
+        raw["date"] = pd.to_datetime(raw["date"]).dt.normalize()
+        raw = raw.merge(existing[["date", "financing_yi", "margin_total_yi"]], on="date", how="outer")
+        meta["cached_totals"] = int(((raw["融资余额_亿元"].isna() & raw["financing_yi"].notna()) |
+                                     (raw["两融余额_亿元"].isna() & raw["margin_total_yi"].notna())).sum())
+        raw["融资余额_亿元"] = raw["融资余额_亿元"].fillna(raw["financing_yi"])
+        raw["两融余额_亿元"] = raw["两融余额_亿元"].fillna(raw["margin_total_yi"])
+    else:
+        meta["cached_totals"] = 0
+    enriched = clip_from_2015(enrich_margin(raw, lookback_years=lookback_years))
+    if enriched.empty:
+        return {**meta, "wrote": 0}
 
-    board_meta: dict[str, Any] = {"fetched": 0, "have": int(len(have_boards)), "ok": True}
+    have_boards = existing.loc[existing[atomics].notna().any(axis=1), ["date", *atomics]].copy()
+    complete_boards = have_boards.loc[have_boards[atomics].notna().all(axis=1)]
+    target_dates = set(select_board_fetch_dates(enriched["date"], [], max_days=len(enriched)))
+    need = []
+
+    board_meta: dict[str, Any] = {"fetched": 0, "have": int(len(complete_boards)), "ok": True,
+                                  "partial": 0, "failed": 0, "details": [],
+                                  "skipped": board_max_days <= 0}
     if board_max_days > 0:
         need = select_board_fetch_dates(
             enriched["date"],
-            have_boards["date"] if not have_boards.empty else [],
+            complete_boards["date"] if not complete_boards.empty else [],
             max_days=board_max_days,
         )
         board_meta["planned"] = int(len(need))
         if need:
             _p(f"融资分板：补 {len(need)} 日…", 2, 3)
             boards = fetch_margin_boards_for_dates(need, progress_cb=progress_cb)
-            board_meta["fetched"] = int(len(boards))
             if not boards.empty:
+                board_meta["fetched"] = int((boards["ok"] | boards["partial"]).sum())
+                board_meta["partial"] = int(boards["partial"].sum())
+                board_meta["failed"] = int((~boards["ok"] & ~boards["partial"]).sum())
+                board_meta["ok"] = board_meta["partial"] == 0 and board_meta["failed"] == 0
+                board_meta["details"] = [
+                    {"date": str(pd.Timestamp(row["date"]).date()), "ok": bool(row["ok"]),
+                     "partial": bool(row["partial"]), "sse_rows": int(row["_sse_n"]),
+                     "szse_rows": int(row["_szse_n"]), "errors": row["errors"]}
+                    for _, row in boards.iterrows()
+                ]
                 add = pd.DataFrame(
                     {
                         "date": pd.to_datetime(boards["date"]).dt.normalize(),
@@ -234,14 +278,28 @@ def ingest_margin(
                         "star_yi": pd.to_numeric(boards["科创板_亿元"], errors="coerce"),
                     }
                 )
-                have_boards = (
-                    pd.concat([have_boards, add], ignore_index=True)
-                    .drop_duplicates("date", keep="last")
-                )
+                have_boards = add.set_index("date").combine_first(have_boards.set_index("date")).reset_index()
         else:
             _p("融资分板：已齐，跳过", 2, 3)
     else:
         _p("融资分板：本轮不拉", 2, 3)
+        board_meta["planned"] = 0
+
+    relevant_boards = have_boards.loc[have_boards["date"].isin(target_dates)]
+    complete = set(relevant_boards.loc[relevant_boards[atomics].notna().all(axis=1), "date"])
+    partial = set(relevant_boards.loc[relevant_boards[atomics].notna().any(axis=1) &
+                                      relevant_boards[atomics].isna().any(axis=1), "date"])
+    missing = target_dates - complete - partial
+    board_meta.update({
+        "target": len(target_dates),
+        "complete": len(complete),
+        "remaining_partial": len(partial),
+        "remaining_missing": len(missing),
+        "remaining_unplanned": len((partial | missing) - set(need)),
+    })
+    board_meta["ok"] = bool(board_meta["ok"] and not partial and not missing)
+    meta["partial"] = bool(meta.get("partial") or not board_meta["ok"])
+    meta["ok"] = bool(meta.get("ok") and board_meta["ok"])
 
     out = pd.DataFrame(
         {
@@ -267,6 +325,10 @@ def ingest_margin(
     meta["boards"] = board_meta
     xc = meta.get("cross_check") or {}
     note = "沪深融资余额"
+    if meta["partial"]:
+        note += " · partial"
+    if meta["cached_totals"]:
+        note += f" · 缓存总额{meta['cached_totals']}日"
     if board_meta.get("fetched"):
         note += f" · 分板+{board_meta['fetched']}"
     elif board_meta.get("have"):
@@ -275,7 +337,8 @@ def ingest_margin(
         note += " · xcheck OK"
     elif xc.get("stable") is False:
         note += " · xcheck WARN"
-    touch_series(con, "margin_daily", last_date=_last(enriched), note=note)
+    last_stored = con.execute("SELECT MAX(date) FROM margin_daily WHERE financing_yi IS NOT NULL").fetchone()[0]
+    touch_series(con, "margin_daily", last_date=last_stored, note=note)
     try:
         _invalidate_load_cache()
         from data_source.dp_cycle.gui_bundle import invalidate_web_payload_cache

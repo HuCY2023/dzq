@@ -12,6 +12,7 @@ import pandas as pd
 from data_source.dp_cycle.store import HISTORY_START_STR, load_from_db, table_counts
 
 DEFAULT_WEEKLY_INDEX = "sh000001"
+PAYLOAD_CACHE_VERSION = 2
 INDEX_CHOICES = {
     "上证指数": "sh000001",
     "沪深300": "sh000300",
@@ -81,7 +82,11 @@ def load_dp_cycle_gui_bundle(
     refresh=True：先按颗粒度更新入库，再读库
     """
     del margin_lookback_years  # 入库时用默认；读库不再现算
-    meta: dict[str, Any] = {"index_symbol": index_symbol, "history_start": HISTORY_START_STR}
+    meta: dict[str, Any] = {
+        "index_symbol": index_symbol,
+        "history_start": HISTORY_START_STR,
+        "as_of": (as_of or date.today()).isoformat(),
+    }
 
     def _p(msg: str, cur: int = 0, tot: int = 0) -> None:
         print(f"[dp_cycle] {msg}", flush=True)
@@ -112,22 +117,23 @@ def load_dp_cycle_gui_bundle(
     tables = load_from_db(index_symbol=index_symbol, start=HISTORY_START_STR)
     weekly_df = tables.get("weekly")
     if weekly_df is None or getattr(weekly_df, "empty", True):
-        from data_source.dp_cycle.store import list_weekly_symbols
+        meta["weekly_error"] = f"库中没有 {index_symbol} 的周线，请更新该指数的数据。"
+    from data_source.dp_cycle.trade_calendar import load_trade_calendar
 
-        for alt in list_weekly_symbols():
-            if alt == index_symbol:
-                continue
-            alt_tables = load_from_db(index_symbol=alt, start=HISTORY_START_STR)
-            if not alt_tables.get("weekly", pd.DataFrame()).empty:
-                tables["weekly"] = alt_tables["weekly"]
-                meta["index_symbol_requested"] = index_symbol
-                meta["index_symbol"] = alt
-                meta["weekly_fallback"] = (
-                    f"库中无 {index_symbol} 周线，先用 {alt}。"
-                    "其他指数请点「更新入库」。"
-                )
-                index_symbol = alt
-                break
+    calendar_dates, calendar_meta = load_trade_calendar(refresh=refresh)
+    meta["trade_calendar"] = calendar_meta
+    trade_calendar = None
+    if calendar_meta.get("ok"):
+        source = "新浪交易日历（AkShare）" if calendar_meta.get("origin") else "本地交易日历缓存（来源未记录）"
+        trade_calendar = {
+            "dates": calendar_dates["date"].dt.strftime("%Y-%m-%d").tolist(),
+            "coverage_start": calendar_meta.get("start_date"),
+            "coverage_end": calendar_meta.get("end_date"),
+            "source": source,
+        }
+    tables["trade_calendar"] = trade_calendar
+    if as_of is not None:
+        tables = _clip_bundle_as_of(tables, as_of)
     counts = table_counts()
     meta["counts"] = counts
     _wk = tables.get("weekly")
@@ -162,10 +168,16 @@ def load_dp_cycle_gui_bundle(
         monthly_mf = pd.DataFrame()
 
     etf_hist = tables.get("etf_hist", pd.DataFrame())
+    etf_hist_adjusted = pd.DataFrame()
+    etf_daily = tables.get("etf_daily", pd.DataFrame())
     etf_m = pd.DataFrame()
     if not etf_hist.empty:
-        from data_source.dp_cycle.national_team_etf import monthly_share_change
+        from data_source.dp_cycle.national_team_etf import adjust_share_events, monthly_share_change
 
+        etf_hist_adjusted = adjust_share_events(etf_hist)
+        etf_daily = etf_hist_adjusted.groupby("date", as_index=False)["份额_调整后_亿份"].sum().rename(
+            columns={"份额_调整后_亿份": "份额_亿份"}
+        )
         etf_m = monthly_share_change(etf_hist)
 
     # 各表 ok 标记
@@ -179,6 +191,17 @@ def load_dp_cycle_gui_bundle(
     ):
         df = tables.get(tbl, pd.DataFrame())
         meta[key] = {"ok": not df.empty, "rows": int(len(df))}
+        if key == "weekly" and meta.get("weekly_error"):
+            meta[key]["error"] = meta["weekly_error"]
+        if key == "01_main_force" and not df.empty:
+            ordered = df.sort_values("date")
+            net = pd.to_numeric(ordered["净额_亿元"], errors="coerce")
+            valid = ordered.loc[net.notna()]
+            meta[key].update({
+                "ok": bool(net.notna().iloc[-1]),
+                "partial": bool(net.isna().any()),
+                "last_date": str(pd.to_datetime(valid["date"]).max().date()) if not valid.empty else None,
+            })
 
     # 美股拥挤度：读库只吃本地快照（无缓存就跳过，绝不在打开软件时扫 FRED/akshare）；
     # 「更新入库」才强制联网重算并写缓存。
@@ -196,10 +219,13 @@ def load_dp_cycle_gui_bundle(
             us_crowding = load_cached_crowding_snapshot(max_age_hours=24 * 14)
         if us_crowding:
             meta["us_crowding"] = {
-                "ok": True,
+                "ok": us_crowding.get("evaluable_count") == 5 and not us_crowding.get("refresh_failed"),
+                "partial": us_crowding.get("evaluable_count", 0) < 5,
                 "score": us_crowding.get("crowding_score"),
                 "verdict": us_crowding.get("verdict"),
                 "from_cache": not bool(refresh),
+                "refresh_failed": bool(us_crowding.get("refresh_failed")),
+                "component_status": us_crowding.get("component_status") or {},
             }
         else:
             meta["us_crowding"] = {
@@ -219,9 +245,11 @@ def load_dp_cycle_gui_bundle(
         "main_force_weekly": weekly_mf,
         "main_force_monthly": monthly_mf,
         "northbound_daily": tables.get("northbound_daily", pd.DataFrame()),
-        "etf_daily": tables.get("etf_daily", pd.DataFrame()),
+        "etf_daily": etf_daily,
         "etf_monthly": etf_m,
         "etf_hist": etf_hist,
+        "etf_hist_adjusted": etf_hist_adjusted,
+        "trade_calendar": trade_calendar,
         "margin": tables.get("margin", pd.DataFrame()),
         "growth_value": tables.get("growth_value", pd.DataFrame()),
         "high_low": tables.get("high_low", pd.DataFrame()),
@@ -242,6 +270,52 @@ def _date_str(v: Any) -> str | None:
     if pd.isna(ts):
         return None
     return ts.strftime("%Y-%m-%d")
+
+
+def _clip_bundle_as_of(bundle: dict[str, Any], as_of: date | str) -> dict[str, Any]:
+    """按观察日截断图表输入；解禁计划只在可证明已公布时用于历史视角。"""
+    cutoff = pd.Timestamp(as_of).normalize()
+    clipped = dict(bundle)
+    for key in (
+        "weekly", "main_force_daily", "main_force_weekly", "main_force_monthly",
+        "northbound_daily", "etf_daily", "etf_hist", "etf_hist_adjusted", "etf_monthly",
+        "margin", "growth_value", "high_low", "fund_issue", "holder_reduce", "industry_flow_daily",
+    ):
+        frame = clipped.get(key)
+        if isinstance(frame, pd.DataFrame) and "date" in frame.columns:
+            dates = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+            visible = dates <= cutoff
+            if "available_at" in frame.columns:
+                released = pd.to_datetime(frame["available_at"], errors="coerce")
+                available = released <= cutoff
+                if key == "weekly":
+                    from data_source.dp_cycle.diagnosis import _calendar_week
+
+                    week_end = cutoff + pd.Timedelta(days=4 - cutoff.weekday())
+                    trading_days = _calendar_week(clipped.get("trade_calendar"), week_end)
+                    if trading_days and max(trading_days) < cutoff:
+                        visible |= (dates == week_end) & (released <= cutoff)
+                visible &= available
+            clipped[key] = frame.loc[visible].copy()
+    unlock = clipped.get("unlock_daily")
+    if isinstance(unlock, pd.DataFrame):
+        if "available_at" in unlock.columns:
+            visible = pd.to_datetime(unlock["available_at"], errors="coerce") <= cutoff
+            clipped["unlock_daily"] = unlock.loc[visible].copy()
+        elif cutoff < pd.Timestamp.today().normalize():
+            clipped["unlock_daily"] = unlock.iloc[0:0].copy()
+    hist = clipped.get("etf_hist")
+    if isinstance(hist, pd.DataFrame) and not hist.empty:
+        from data_source.dp_cycle.national_team_etf import adjust_share_events, monthly_share_change
+
+        adjusted = adjust_share_events(hist)
+        daily = adjusted.groupby("date", as_index=False)["份额_调整后_亿份"].sum(min_count=1).rename(
+            columns={"份额_调整后_亿份": "份额_亿份"}
+        )
+        clipped["etf_hist_adjusted"] = adjusted
+        clipped["etf_daily"] = daily
+        clipped["etf_monthly"] = monthly_share_change(hist)
+    return clipped
 
 
 def _weekly_anchor_dates(weekly: pd.DataFrame | None) -> pd.DatetimeIndex:
@@ -322,6 +396,15 @@ def _db_mtime_ns() -> int:
         return 0
 
 
+def _us_snapshot_mtime_ns() -> int:
+    from data_source.dp_cycle.us_crowding import _snapshot_cache_path
+
+    try:
+        return int(os.stat(_snapshot_cache_path()).st_mtime_ns)
+    except OSError:
+        return 0
+
+
 def _payload_cache_path(index_symbol: str) -> "Path":
     from pathlib import Path
 
@@ -334,7 +417,7 @@ def _payload_cache_path(index_symbol: str) -> "Path":
 def load_cached_web_payload(
     index_symbol: str, *, require_heavy: bool = False
 ) -> dict[str, Any] | None:
-    """读 GUI 网页载荷缓存；库文件 mtime 变化则失效。"""
+    """读 GUI 网页载荷缓存；依赖变化或跨日时重新计算。"""
     import json
 
     path = _payload_cache_path(index_symbol)
@@ -345,7 +428,13 @@ def load_cached_web_payload(
         if not isinstance(raw, dict):
             return None
         envelope = raw.get("_cache") or {}
+        if envelope.get("version") != PAYLOAD_CACHE_VERSION:
+            return None
+        if str(envelope.get("saved_at") or "")[:10] != date.today().isoformat():
+            return None
         if int(envelope.get("db_mtime_ns") or -1) != _db_mtime_ns():
+            return None
+        if envelope.get("us_snapshot_mtime_ns") != _us_snapshot_mtime_ns():
             return None
         if str(envelope.get("index_symbol") or "") != str(index_symbol):
             return None
@@ -374,7 +463,9 @@ def save_web_payload_cache(
         envelope = {
             "_cache": {
                 "index_symbol": index_symbol,
+                "version": PAYLOAD_CACHE_VERSION,
                 "db_mtime_ns": _db_mtime_ns(),
+                "us_snapshot_mtime_ns": _us_snapshot_mtime_ns(),
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
                 "heavy": bool((payload.get("diagnosis") or {}).get("heavy", True)),
             },
@@ -454,8 +545,24 @@ def bundle_to_web_payload(
     bundle: dict[str, Any], *, index_label: str = "", heavy: bool = True
 ) -> dict[str, Any]:
     """网页载荷：五项一律周频，与顶图周线同一时间网格，避免日频/稀疏点对不齐。"""
+    as_of = (bundle.get("meta") or {}).get("as_of")
+    if as_of:
+        bundle = _clip_bundle_as_of(bundle, as_of)
     weekly = bundle.get("weekly")
     anchor = _weekly_anchor_dates(weekly)
+    incomplete_anchor = None
+    if as_of and len(anchor):
+        cutoff = pd.Timestamp(as_of).normalize()
+        if cutoff.weekday() < 4:
+            friday = cutoff + pd.Timedelta(days=4 - cutoff.weekday())
+            for key in ("main_force_daily", "margin", "growth_value", "high_low", "etf_daily"):
+                frame = bundle.get(key)
+                if isinstance(frame, pd.DataFrame) and "date" in frame.columns:
+                    dates = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+                    if friday not in anchor and ((dates > friday - pd.Timedelta(days=7)) & (dates <= cutoff)).any():
+                        incomplete_anchor = friday
+                        anchor = anchor.union(pd.DatetimeIndex([friday])).sort_values()
+                        break
     # ── 性能优化：向量化替代 iterrows ──
     w_rows: list[dict[str, Any]] = []
     if weekly is not None and not weekly.empty:
@@ -558,9 +665,9 @@ def bundle_to_web_payload(
     unlock_m = aggregate_unlock_periods(unlock_daily, anchor, freq="ME")
     unlock_q = aggregate_unlock_periods(unlock_daily, anchor, freq="QE")
     real_last = pd.Timestamp(anchor.max()).normalize() if anchor is not None and len(anchor) else None
-    axis_tail = []
+    axis_tail = [incomplete_anchor.strftime("%Y-%m-%d")] if incomplete_anchor is not None else []
     if real_last is not None:
-        axis_tail = [
+        axis_tail += [
             pd.Timestamp(day).strftime("%Y-%m-%d")
             for day in anchor_ext
             if pd.Timestamp(day).normalize() > real_last
@@ -590,8 +697,22 @@ def bundle_to_web_payload(
     unlock_m_rows = _unlock_rows(unlock_m)
     unlock_q_rows = _unlock_rows(unlock_q)
     subtitle = f"2015至今 · {index_label or sym} 周线 · 解禁含未来半年"
+    etf_hist_adjusted = bundle.get("etf_hist_adjusted")
+    etf_has_codes = (
+        isinstance(etf_hist_adjusted, pd.DataFrame)
+        and not etf_hist_adjusted.empty
+        and "code" in etf_hist_adjusted.columns
+        and etf_hist_adjusted["code"].notna().any()
+    )
+    etf_basis = "按已发生份额事件折算" if etf_has_codes else "缺逐基金数据，无法逐基金折算"
+    if not etf_w.empty:
+        subtitle += f" · ETF{etf_basis}，非资金净流入"
     if qsum:
         subtitle = f"{subtitle} · {qsum}"
+    if meta.get("weekly_error"):
+        subtitle = f"{subtitle} · {meta['weekly_error']}"
+    if isinstance(meta.get("ingest"), dict) and not meta["ingest"].get("ok"):
+        subtitle = f"{subtitle} · 本次更新未全部完成，部分数据可能沿用缓存"
 
     mf_m_rows = _series_df(mf_m, "净额_亿元")
     mf_w_rows = _series_df(mf_w, "净额_亿元")
@@ -615,6 +736,14 @@ def bundle_to_web_payload(
             return None
         return {"first": times[0], "last": times[-1], "n": len(times)}
 
+    def _source_span(frame: pd.DataFrame | None, value_col: str, rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not isinstance(frame, pd.DataFrame) or frame.empty or not {"date", value_col}.issubset(frame.columns):
+            return _span(rows)
+        dates = pd.to_datetime(frame.loc[pd.to_numeric(frame[value_col], errors="coerce").notna(), "date"], errors="coerce").dropna()
+        if dates.empty:
+            return _span(rows)
+        return {"first": str(dates.min().date()), "last": str(dates.max().date()), "n": len(rows)}
+
     def _coverage() -> dict[str, Any]:
         return {
             "weekly": len(w_rows),
@@ -632,21 +761,22 @@ def bundle_to_web_payload(
     # 与周K同轴时，短窗/断档会显示为大片空白——这是源覆盖，不是联动故障
     coverage_span = {
         "weekly": _span(w_rows),
-        "mf_month": _span(mf_m_rows),
-        "mf_week": _span(mf_w_rows),
-        "northbound_week": _span(nb_rows),
-        "etf": _span(etf_rows),
-        "margin": _span(margin_rows),
-        "growth_value": _span(gv_rows),
-        "high_low": _span(hl_rows),
+        "mf_month": _source_span(mf_daily, "净额_亿元", mf_m_rows),
+        "mf_week": _source_span(mf_daily, "净额_亿元", mf_w_rows),
+        "northbound_week": _source_span(bundle.get("northbound_daily"), "净额_亿元", nb_rows),
+        "etf": _source_span(bundle.get("etf_daily"), "份额_亿份", etf_rows),
+        "margin": _source_span(margin_src, "融资余额_亿元", margin_rows),
+        "growth_value": _source_span(bundle.get("growth_value"), "偏离度", gv_rows),
+        "high_low": _source_span(hl, "new_high", hl_rows),
         "unlock_month": _span(unlock_m_rows),
         "unlock_quarter": _span(unlock_q_rows),
     }
     coverage_note = {
+        "weekly": "周线日期为周五周期标签，原始最后交易日未保存在周线表中",
         "mf_month": "东财大盘主力日K约近半年，月柱只落在窗内",
         "mf_week": "东财大盘主力日K约近半年，更早无公开长历史",
         "northbound_week": "东财「当日成交净买额」2024-08 后停更，右侧空白属源断档",
-        "etf": "上交所核心宽基月末回填，历史短于周K属正常",
+        "etf": f"上交所核心宽基月末回填，{etf_basis}，非资金净流入；历史短于周K属正常",
         "margin": "全市场=沪深合计；分板=个股明细汇总（主板=沪+深主板，深市=深主板+创业，与创业有重叠）",
         "growth_value": None,
         "high_low": hl_note,
@@ -656,7 +786,7 @@ def bundle_to_web_payload(
 
     from data_source.dp_cycle.diagnosis import diagnose_position
 
-    diagnosis = diagnose_position(bundle, heavy=heavy)
+    diagnosis = diagnose_position(bundle, heavy=heavy, as_of=meta.get("as_of"))
 
     return {
         "subtitle": subtitle,

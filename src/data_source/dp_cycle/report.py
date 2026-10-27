@@ -27,16 +27,16 @@ def plot_main_force(agg: dict[str, pd.DataFrame], out_path: str) -> str | None:
     if monthly.empty and weekly.empty and daily.empty:
         return None
     fig, axes = plt.subplots(3, 1, figsize=(11, 9), constrained_layout=True)
-    fig.suptitle("01 主力资金（THS 行业净额加总 · 本地增量）", fontsize=13)
+    fig.suptitle("01 主力资金（公开接口 · 本地增量）", fontsize=13)
 
     if not monthly.empty:
         ax = axes[0]
         ax.bar(monthly["date"], monthly["净额_亿元"], width=20, color="#5b8ff9", alpha=0.85)
         if "作者月基准线" in monthly.columns:
             ax.axhline(float(monthly["作者月基准线"].iloc[0]), color="#f4664a", ls="--", lw=1, label="作者月基准 −4000")
+            ax.legend(loc="upper right", fontsize=8)
         ax.set_ylabel("亿元")
         ax.set_title("月度净额")
-        ax.legend(loc="upper right", fontsize=8)
         ax.grid(True, alpha=0.3)
 
     if not weekly.empty:
@@ -44,9 +44,9 @@ def plot_main_force(agg: dict[str, pd.DataFrame], out_path: str) -> str | None:
         ax.bar(weekly["date"], weekly["净额_亿元"], width=4, color="#5ad8a6", alpha=0.85)
         if "作者周警戒线" in weekly.columns:
             ax.axhline(float(weekly["作者周警戒线"].iloc[0]), color="#f4664a", ls="--", lw=1, label="作者周警戒 −2000")
+            ax.legend(loc="upper right", fontsize=8)
         ax.set_ylabel("亿元")
         ax.set_title("周度净额")
-        ax.legend(loc="upper right", fontsize=8)
         ax.grid(True, alpha=0.3)
 
     if not daily.empty:
@@ -66,14 +66,14 @@ def plot_national_team(hist: pd.DataFrame, monthly: pd.DataFrame, out_path: str)
     if hist.empty and monthly.empty:
         return None
     fig, axes = plt.subplots(2, 1, figsize=(11, 7), constrained_layout=True)
-    fig.suptitle("02 国家队代理：核心沪深300 ETF 份额（申赎代理≠汇金/证金）", fontsize=12)
+    fig.suptitle("02 核心宽基ETF：按已发生份额事件折算，非资金净流入", fontsize=12)
 
     ax = axes[0]
     if not hist.empty:
         for code, g in hist.groupby("code"):
-            ax.plot(g["date"], g["份额_亿份"], label=f"{code}", lw=1.3)
+            ax.plot(g["date"], g["份额_调整后_亿份"], label=f"{code}", lw=1.3)
         ax.set_ylabel("亿份")
-        ax.set_title("日度份额（本地增量库）")
+        ax.set_title("逐基金日度份额（事件折算后）")
         ax.legend(fontsize=8, ncol=2)
         ax.grid(True, alpha=0.3)
 
@@ -164,25 +164,27 @@ def plot_growth_value(df: pd.DataFrame, out_path: str) -> str | None:
 
 
 def plot_high_low(df: pd.DataFrame, out_path: str) -> str | None:
+    from data_source.dp_cycle.gui_bundle import _high_low_captions
+
     setup_matplotlib_chinese()
     if df.empty:
         return None
     fig, axes = plt.subplots(3, 1, figsize=(11, 9), constrained_layout=True)
-    fig.suptitle("05 52周新高−新低（本地K线湖）", fontsize=13)
+    fig.suptitle(_high_low_captions(df)[2], fontsize=13)
     d = df.copy()
 
     ax = axes[0]
     if "index_close" in d.columns and d["index_close"].notna().any():
         ax.plot(d["date"], d["index_close"], color="#5b8ff9", lw=1.2)
         ax.set_ylabel("指数")
-        ax.set_title("对照：科创综指收盘")
+        ax.set_title("对照：数据源提供的指数收盘")
     else:
         ax.text(0.5, 0.5, "无指数对照", ha="center", transform=ax.transAxes)
     ax.grid(True, alpha=0.3)
 
     ax = axes[1]
-    ax.plot(d["date"], d["new_high"], color="#f4664a", lw=1.1, label="52周新高家数")
-    ax.plot(d["date"], d["new_low"], color="#5ad8a6", lw=1.1, label="52周新低家数")
+    ax.plot(d["date"], d["new_high"], color="#f4664a", lw=1.1, label="新高家数")
+    ax.plot(d["date"], d["new_low"], color="#5ad8a6", lw=1.1, label="新低家数")
     ax.legend(fontsize=8)
     ax.set_title("家数")
     ax.grid(True, alpha=0.3)
