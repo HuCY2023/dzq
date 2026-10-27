@@ -17,7 +17,7 @@ spec.loader.exec_module(script)
 
 
 class ReportSnapshotsTests(unittest.TestCase):
-    def _run(self, root, *, score, fail_pdf=False, flow_source=None, change_events=False, change_disclosures=False):
+    def _run(self, root, *, score, fail_pdf=False, flow_source=None, turnover_source=None, change_events=False, change_disclosures=False):
         out = Path(root, "dated")
         store = Path(root, "store")
         events = Path(root, "etf_share_events.csv")
@@ -33,6 +33,8 @@ class ReportSnapshotsTests(unittest.TestCase):
                   "etf_holder_disclosures": {"as_of": "2026-10-27", "status": "partial"}}
         if flow_source is not None:
             bundle["etf_flow"] = {"source": {"snapshot": str(flow_source)}}
+        if turnover_source is not None:
+            bundle["turnover_observation"] = {"snapshot": str(turnover_source), "status": "partial"}
         diagnosis = {"as_of": "2026-10-27", "rule_version": "improved_v1", "score": score,
                      "data_availability": {"margin": {"observation_date": "2026-10-26", "status": "ok"}}}
         payload = {"diagnosis": diagnosis, "coverage_span": {"margin": {"last": "2026-10-26"}},
@@ -114,6 +116,19 @@ class ReportSnapshotsTests(unittest.TestCase):
             run = next((Path(tmp, "dated") / "runs").iterdir())
             self.assertTrue((run / "inputs" / "etf_flow" / "metadata.json").is_file())
             self.assertFalse((run / "inputs" / "etf_flow" / "etf_share_events.csv").exists())
+
+    def test_turnover_source_is_archived_with_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            imported = Path(tmp, "turnover")
+            imported.mkdir()
+            for name in ("observation.json", "source_summary.json", "latest-top5.csv"):
+                (imported / name).write_text("original", encoding="utf-8")
+            self.assertEqual(self._run(tmp, score=1, turnover_source=imported), 0)
+            run = next((Path(tmp, "dated") / "runs").iterdir())
+            archived = run / "inputs" / "turnover" / "latest-top5.csv"
+            self.assertEqual(archived.read_text(encoding="utf-8"), "original")
+            (imported / "latest-top5.csv").write_text("changed", encoding="utf-8")
+            self.assertEqual(archived.read_text(encoding="utf-8"), "original")
 
     def test_event_table_change_during_report_preserves_existing_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -267,6 +282,23 @@ class ReportSnapshotsTests(unittest.TestCase):
             self.assertIsNotNone(gui_bundle.load_cached_web_payload("sh000001"))
             (newer / "metadata.json").write_text("{}", encoding="utf-8")
             os.utime(newer / "metadata.json", ns=(1_700_000_100_000_000_000,) * 2)
+            self.assertIsNone(gui_bundle.load_cached_web_payload("sh000001"))
+
+    def test_turnover_source_change_invalidates_payload_cache(self):
+        from data_source.dp_cycle import gui_bundle
+
+        with tempfile.TemporaryDirectory() as tmp, patch("output_paths.dp_cycle_store_dir", return_value=tmp), patch.object(
+            gui_bundle, "_db_mtime_ns", return_value=1
+        ), patch.object(gui_bundle, "_us_snapshot_mtime_ns", return_value=1):
+            imported = Path(tmp, "turnover_imports", "selected")
+            imported.mkdir(parents=True)
+            for name in ("observation.json", "source_summary.json", "latest-top5.csv"):
+                (imported / name).write_text("fixture", encoding="utf-8")
+            gui_bundle.save_web_payload_cache("sh000001", {"diagnosis": {"rule_version": "improved_v1"}})
+            self.assertIsNotNone(gui_bundle.load_cached_web_payload("sh000001"))
+            changed = imported / "latest-top5.csv"
+            timestamp = changed.stat().st_mtime_ns + 1_000_000_000
+            os.utime(changed, ns=(timestamp, timestamp))
             self.assertIsNone(gui_bundle.load_cached_web_payload("sh000001"))
 
     def test_calendar_copy_added_to_selected_snapshot_invalidates_cache(self):

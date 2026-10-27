@@ -16,7 +16,7 @@ class Element {
 
 const names = ["diagState", "diagScore", "scoreBig", "scoreLogic", "scoreSumBar",
   "scoreFormula", "scoreTableBody", "scoreBoardHint", "layersHost", "currentWeek", "empty",
-  "redLightGrid", "redLightHint", "redLightNote", "analysisDate", "etfFlowText", "etfHolderText"];
+  "redLightGrid", "redLightHint", "redLightNote", "analysisDate", "etfFlowText", "etfHolderText", "turnoverText"];
 const elements = Object.fromEntries(names.map((name) => [name, new Element()]));
 const document = {
   getElementById: (name) => elements[name] || null,
@@ -29,7 +29,10 @@ vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../web/dp_cycle/app.js"
   setTimeout: () => 1, clearTimeout() {}, console,
 });
 
-window.renderDpCycle({ etf_holder_disclosures: {coverage: {verified_reports: 4, expected: 4},
+window.renderDpCycle({ turnover_observation: {status: "partial", date: "2026-10-22", stocks: 5568,
+  source_requested_as_of: "2026-10-26", top_counts: {"1": 56, "3": 168, "5": 279},
+  shares_pct: {"1": 20.3854, "3": 35.4228, "5": 44.7365}, top5_amount_yi: 6892.4342,
+  note: "证券名录未核对，不参与评分，成交额不是净流入。"}, etf_holder_disclosures: {coverage: {verified_reports: 4, expected: 4},
   display: "已核验基金报告 4/4 只；未披露不等于零，历史快照不能作为当前持仓。", items: [
   {code: "510300", status: "not_disclosed", period_end: "2026-06-30", published_date: "2026-08-29",
    source_url: "https://example.com/current.pdf", last_named: {period_end: "2025-12-31", direct_shares: 73513073833, source_url: "https://example.com/prior.pdf"}},
@@ -76,6 +79,8 @@ assert.match(elements.etfHolderText.children[0].textContent, /510300.*2026-06-30
 assert.equal(elements.etfHolderText.children[0].children[0].href, "https://example.com/current.pdf");
 assert.equal(elements.etfHolderText.children[0].children[1].href, "https://example.com/prior.pdf");
 assert.match(elements.etfHolderText.children[1].textContent, /159919.*2026-08-31.*354\.98.*历史/);
+assert.match(elements.turnoverText.textContent, /2026-10-22.*5568.*20\.39%.*35\.42%.*44\.74%.*6892\.43/);
+assert.match(elements.turnoverText.textContent, /2026-10-26.*证券名录.*不参与评分.*不是净流入/);
 assert.match(elements.redLightGrid.children[0].innerHTML, />未知</);
 assert.match(elements.redLightGrid.children[1].innerHTML, />灭</);
 assert.match(elements.redLightHint.textContent, /已知 1\/4/);
