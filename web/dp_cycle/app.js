@@ -1286,15 +1286,31 @@
     if (holderText) {
       const disclosures = data.etf_holder_disclosures || {};
       holderText.textContent = disclosures.display || "尚未核验持有人报告。";
-      const report = (disclosures.items || []).find((item) => item.code === "159919" && item.source_url);
-      if (report && report.source_url.startsWith("https://")) {
-        const link = document.createElement("a");
-        link.href = report.source_url;
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        link.textContent = " 查看原报告";
-        holderText.appendChild(link);
-      }
+      (disclosures.items || []).forEach((item) => {
+        const row = document.createElement("div");
+        if (item.status === "not_verified") {
+          row.textContent = item.code + "：尚未核验当时可用的报告。";
+        } else {
+          row.textContent = item.code + "：报告期 " + item.period_end + "，公告 " + item.published_date +
+            (item.status === "not_disclosed" ? "，未列实名。" : "，已披露实名。 ");
+          const named = item.status === "named_disclosure" ? item : item.last_named;
+          if (named && named.direct_shares != null) {
+            row.textContent += named.period_end + " 汇金投资与汇金资管直接持有合计 " +
+              (Number(named.direct_shares) / 1e8).toFixed(2) + " 亿份（历史快照）。";
+          }
+        }
+        [[item.source_url, " 本期报告"], [(item.last_named || {}).source_url, " 历史报告"]].forEach(([url, label]) => {
+          if (url && url.startsWith("https://")) {
+            const link = document.createElement("a");
+            link.href = url;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            link.textContent = label;
+            row.appendChild(link);
+          }
+        });
+        holderText.appendChild(row);
+      });
     }
     try { renderQuality(data); } catch (e) { console.warn("renderQuality", e); }
     try { renderDiagnosis(data); } catch (e) { console.warn("renderDiagnosis", e); }
