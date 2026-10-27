@@ -73,6 +73,8 @@ def load_dp_cycle_gui_bundle(
     refresh: bool = False,
     skip_high_low: bool = False,
     mode: str = "auto",
+    board_max_days: int = 10,
+    progress_cb: Any | None = None,
 ) -> dict[str, Any]:
     """
     refresh=False：只读库（2015+）
@@ -81,15 +83,30 @@ def load_dp_cycle_gui_bundle(
     del margin_lookback_years  # 入库时用默认；读库不再现算
     meta: dict[str, Any] = {"index_symbol": index_symbol, "history_start": HISTORY_START_STR}
 
+    def _p(msg: str, cur: int = 0, tot: int = 0) -> None:
+        print(f"[dp_cycle] {msg}", flush=True)
+        if progress_cb is not None:
+            try:
+                progress_cb(cur, tot, msg)
+            except Exception:
+                pass
+
     if refresh:
         from data_source.dp_cycle.ingest import update_dp_cycle_db
 
+        try:
+            invalidate_web_payload_cache()
+        except Exception:
+            pass
+        _p("开始联网更新入库…", 0, 1)
         meta["ingest"] = update_dp_cycle_db(
             mode=mode,
             index_symbol=index_symbol,
             high_low_start=high_low_start,
             as_of=as_of,
             skip_high_low=skip_high_low,
+            board_max_days=board_max_days,
+            progress_cb=progress_cb,
         )
 
     tables = load_from_db(index_symbol=index_symbol, start=HISTORY_START_STR)
@@ -173,6 +190,7 @@ def load_dp_cycle_gui_bundle(
         )
 
         if refresh:
+            _p("美股拥挤度快照…", 0, 1)
             us_crowding = load_or_compute_crowding_snapshot(force_refresh=True)
         else:
             us_crowding = load_cached_crowding_snapshot(max_age_hours=24 * 14)
@@ -394,6 +412,8 @@ def load_gui_web_result(
     skip_high_low: bool = False,
     mode: str = "auto",
     heavy: bool | None = None,
+    board_max_days: int = 10,
+    progress_cb: Any | None = None,
 ) -> dict[str, Any]:
     """GUI 一站式：优先磁盘缓存 → 读库组装。refresh 时强制重算并写缓存。"""
     if heavy is None:
@@ -403,6 +423,14 @@ def load_gui_web_result(
         if cached is not None:
             return cached
 
+    def _p(msg: str, cur: int = 0, tot: int = 0) -> None:
+        print(f"[dp_cycle] {msg}", flush=True)
+        if progress_cb is not None:
+            try:
+                progress_cb(cur, tot, msg)
+            except Exception:
+                pass
+
     label = next((k for k, v in INDEX_CHOICES.items() if v == index_symbol), index_symbol)
     bundle = load_dp_cycle_gui_bundle(
         index_symbol=index_symbol,
@@ -410,11 +438,15 @@ def load_gui_web_result(
         refresh=refresh,
         skip_high_low=skip_high_low,
         mode=mode,
+        board_max_days=board_max_days,
+        progress_cb=progress_cb,
     )
+    _p("组装网页载荷…", 0, 1)
     payload = bundle_to_web_payload(bundle, index_label=label, heavy=heavy)
     meta = bundle.get("meta") or {}
     # 入库后库 mtime 已变；读库结果写缓存，下次打开秒开
     save_web_payload_cache(str(meta.get("index_symbol") or index_symbol), payload, meta)
+    _p("更新完成", 1, 1)
     return {"payload": payload, "meta": meta}
 
 
@@ -466,8 +498,18 @@ def bundle_to_web_payload(
     # 02 ETF：周末份额（存量）
     etf_w = _resample_to_weekly(bundle.get("etf_daily"), "份额_亿份", how="last", anchor=anchor)
 
-    # 03 两融：周末融资余额
-    margin_w = _resample_to_weekly(bundle.get("margin"), "融资余额_亿元", how="last", anchor=anchor)
+    # 03 两融：周末融资余额 + 分板（主板/深市/科创/创业）
+    margin_src = bundle.get("margin")
+    margin_w = _resample_to_weekly(margin_src, "融资余额_亿元", how="last", anchor=anchor)
+    margin_board_cols = (
+        ("主板_亿元", "main"),
+        ("深市_亿元", "sz"),
+        ("科创板_亿元", "star"),
+        ("创业板_亿元", "chinext"),
+    )
+    margin_board_w: dict[str, pd.DataFrame] = {}
+    for src_col, key in margin_board_cols:
+        margin_board_w[key] = _resample_to_weekly(margin_src, src_col, how="last", anchor=anchor)
 
     # 04 偏离：周末值
     gv_w = _resample_to_weekly(bundle.get("growth_value"), "偏离度", how="last", anchor=anchor)
@@ -556,6 +598,15 @@ def bundle_to_web_payload(
     nb_rows = _series_df(nb_w, "净额_亿元")
     etf_rows = _series_df(etf_w, "份额_亿份")
     margin_rows = _series_df(margin_w, "融资余额_亿元")
+    # 把分板并进同一 time 行，前端一条 payload 画多线
+    if margin_rows or any(not f.empty for f in margin_board_w.values()):
+        by_t = {str(r["time"]): dict(r) for r in margin_rows}
+        for src_col, key in margin_board_cols:
+            for pt in _series_df(margin_board_w[key], src_col):
+                t = str(pt["time"])
+                row = by_t.setdefault(t, {"time": t})
+                row[key] = pt["value"]
+        margin_rows = [by_t[t] for t in sorted(by_t.keys())]
     gv_rows = _series_df(gv_w, "偏离度")
 
     def _span(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -596,7 +647,7 @@ def bundle_to_web_payload(
         "mf_week": "东财大盘主力日K约近半年，更早无公开长历史",
         "northbound_week": "东财「当日成交净买额」2024-08 后停更，右侧空白属源断档",
         "etf": "上交所核心宽基月末回填，历史短于周K属正常",
-        "margin": None,
+        "margin": "全市场=沪深合计；分板=个股明细汇总（主板=沪+深主板，深市=深主板+创业，与创业有重叠）",
         "growth_value": None,
         "high_low": hl_note,
         "unlock_month": "实际解禁市值，含已排期的未来半年。柱是全市场，线是科创板",

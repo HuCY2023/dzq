@@ -164,31 +164,125 @@ def ingest_etf_shares(con, *, as_of: date | None = None, backfill_months: int = 
     touch_series(con, "etf_shares_daily", last_date=_last(hist), note="SSE核心宽基+月末回填")
     return {**meta, "wrote": n}
 
-def ingest_margin(con, *, lookback_years: int = 5) -> dict[str, Any]:
-    from data_source.dp_cycle.margin import enrich_margin, fetch_margin_daily
+def ingest_margin(
+    con,
+    *,
+    lookback_years: int = 5,
+    board_max_days: int = 10,
+    cross_check: bool = True,
+    progress_cb: Any | None = None,
+) -> dict[str, Any]:
+    """入库融资。
 
-    raw, meta = fetch_margin_daily(cross_check=True)
+    board_max_days：GUI「更新入库」默认只补近端缺日（约 10），避免一次拉百日明细卡死。
+    历史周五长补用 scripts/research/_backfill_margin_boards.py。
+    """
+    from data_source.dp_cycle.margin import (
+        enrich_margin,
+        fetch_margin_boards_for_dates,
+        fetch_margin_daily,
+        select_board_fetch_dates,
+    )
+
+    def _p(msg: str, cur: int = 0, tot: int = 0) -> None:
+        print(f"[dp_cycle] {msg}", flush=True)
+        if progress_cb is not None:
+            try:
+                progress_cb(cur, tot, msg)
+            except Exception:
+                pass
+
+    _p("融资：拉沪深合计…", 1, 3)
+    raw, meta = fetch_margin_daily(cross_check=cross_check)
     enriched = enrich_margin(raw, lookback_years=lookback_years)
     enriched = clip_from_2015(enriched)
     if enriched.empty:
         return {**meta, "wrote": 0}
+
+    # 保留库内已有分板，避免全量重拉
+    have_boards = pd.DataFrame(columns=["date", "sh_main_yi", "sz_main_yi", "chinext_yi", "star_yi"])
+    try:
+        have_boards = con.execute(
+            """
+            SELECT date, sh_main_yi, sz_main_yi, chinext_yi, star_yi
+            FROM margin_daily
+            WHERE sh_main_yi IS NOT NULL
+            """
+        ).df()
+    except Exception:
+        pass
+
+    board_meta: dict[str, Any] = {"fetched": 0, "have": int(len(have_boards)), "ok": True}
+    if board_max_days > 0:
+        need = select_board_fetch_dates(
+            enriched["date"],
+            have_boards["date"] if not have_boards.empty else [],
+            max_days=board_max_days,
+        )
+        board_meta["planned"] = int(len(need))
+        if need:
+            _p(f"融资分板：补 {len(need)} 日…", 2, 3)
+            boards = fetch_margin_boards_for_dates(need, progress_cb=progress_cb)
+            board_meta["fetched"] = int(len(boards))
+            if not boards.empty:
+                add = pd.DataFrame(
+                    {
+                        "date": pd.to_datetime(boards["date"]).dt.normalize(),
+                        "sh_main_yi": pd.to_numeric(boards["沪主板_亿元"], errors="coerce"),
+                        "sz_main_yi": pd.to_numeric(boards["深主板_亿元"], errors="coerce"),
+                        "chinext_yi": pd.to_numeric(boards["创业板_亿元"], errors="coerce"),
+                        "star_yi": pd.to_numeric(boards["科创板_亿元"], errors="coerce"),
+                    }
+                )
+                have_boards = (
+                    pd.concat([have_boards, add], ignore_index=True)
+                    .drop_duplicates("date", keep="last")
+                )
+        else:
+            _p("融资分板：已齐，跳过", 2, 3)
+    else:
+        _p("融资分板：本轮不拉", 2, 3)
+
     out = pd.DataFrame(
         {
-            "date": pd.to_datetime(enriched["date"]).dt.date,
+            "date": pd.to_datetime(enriched["date"]).dt.normalize(),
             "financing_yi": pd.to_numeric(enriched["融资余额_亿元"], errors="coerce"),
             "margin_total_yi": pd.to_numeric(enriched.get("两融余额_亿元"), errors="coerce"),
             "pct_all": pd.to_numeric(enriched.get("分位_全样本"), errors="coerce"),
             "pct_5y": pd.to_numeric(enriched.get("分位_近N年"), errors="coerce"),
         }
     )
+    if not have_boards.empty:
+        hb = have_boards.copy()
+        hb["date"] = pd.to_datetime(hb["date"]).dt.normalize()
+        out = out.merge(hb, on="date", how="left")
+    else:
+        out["sh_main_yi"] = pd.NA
+        out["sz_main_yi"] = pd.NA
+        out["chinext_yi"] = pd.NA
+        out["star_yi"] = pd.NA
+
+    out["date"] = pd.to_datetime(out["date"]).dt.date
     n = upsert_dataframe(con, "margin_daily", out, key_cols=["date"])
+    meta["boards"] = board_meta
     xc = meta.get("cross_check") or {}
     note = "沪深融资余额"
+    if board_meta.get("fetched"):
+        note += f" · 分板+{board_meta['fetched']}"
+    elif board_meta.get("have"):
+        note += f" · 分板{board_meta['have']}日"
     if xc.get("stable") is True:
         note += " · xcheck OK"
     elif xc.get("stable") is False:
         note += " · xcheck WARN"
     touch_series(con, "margin_daily", last_date=_last(enriched), note=note)
+    try:
+        _invalidate_load_cache()
+        from data_source.dp_cycle.gui_bundle import invalidate_web_payload_cache
+
+        invalidate_web_payload_cache()
+    except Exception:
+        pass
     return {**meta, "wrote": n}
 
 
@@ -389,33 +483,77 @@ def update_dp_cycle_db(
     high_low_start: str = HISTORY_START_STR,
     as_of: date | None = None,
     skip_high_low: bool = False,
+    board_max_days: int = 10,
+    progress_cb: Any | None = None,
 ) -> dict[str, Any]:
     """
     全量/增量入库（各表按源数据覆盖 2015+）。
 
     mode 仅作日志标签：auto / weekly / monthly / manual 等，不改变取数逻辑。
     skip_high_low：跳过 K 线湖 52 周扫库；仍会拉乐咕 120 日快径。
+    board_max_days：融资分板增量补日数（GUI 默认 10；长历史请用专用回填脚本）。
     """
+    steps = [
+        "周线",
+        "主力",
+        "北向",
+        "郭嘉队ETF",
+        "融资",
+        "偏离",
+        "解禁",
+        "基金发行",
+        "股东减持",
+        "行业资金",
+        "广度乐咕",
+        "广度湖扫",
+    ]
+
+    def _p(msg: str, cur: int = 0, tot: int = 0) -> None:
+        print(f"[dp_cycle] {msg}", flush=True)
+        if progress_cb is not None:
+            try:
+                progress_cb(cur, tot, msg)
+            except Exception:
+                pass
+
     con = connect()
     _invalidate_load_cache()  # 入库前使缓存失效
     detail: dict[str, Any] = {"mode": mode, "index_symbol": index_symbol}
     ok = True
+    n_steps = len(steps)
     try:
         init_schema(con)
+        _p(f"1/{n_steps} 周线 {index_symbol}…", 1, n_steps)
         detail["index_weekly"] = ingest_index_weekly(con, index_symbol)
+        _p(f"2/{n_steps} 主力…", 2, n_steps)
         detail["main_force"] = ingest_main_force(con, as_of=as_of)
+        _p(f"3/{n_steps} 北向…", 3, n_steps)
         detail["northbound"] = ingest_northbound(con)
+        _p(f"4/{n_steps} 郭嘉队ETF…", 4, n_steps)
         detail["etf"] = ingest_etf_shares(con, as_of=as_of)
-        detail["margin"] = ingest_margin(con)
+        _p(f"5/{n_steps} 融资（合计+近端分板）…", 5, n_steps)
+        detail["margin"] = ingest_margin(
+            con,
+            board_max_days=board_max_days,
+            progress_cb=progress_cb,
+        )
+        _p(f"6/{n_steps} 偏离…", 6, n_steps)
         detail["growth_value"] = ingest_growth_value(con)
+        _p(f"7/{n_steps} 解禁…", 7, n_steps)
         detail["unlock"] = ingest_unlock(con)
+        _p(f"8/{n_steps} 基金发行…", 8, n_steps)
         detail["fund_issue"] = ingest_fund_issue(con)
+        _p(f"9/{n_steps} 股东减持…", 9, n_steps)
         detail["holder_reduce"] = ingest_holder_reduce(con)
+        _p(f"10/{n_steps} 行业资金…", 10, n_steps)
         detail["industry_flow"] = ingest_industry_flow(con)
+        _p(f"11/{n_steps} 广度乐咕…", 11, n_steps)
         detail["high_low_legu"] = ingest_high_low_legu(con)
         if skip_high_low:
             detail["high_low_lake"] = {"ok": True, "wrote": 0, "skipped": True}
+            _p(f"12/{n_steps} 广度湖扫已跳过", 12, n_steps)
         else:
+            _p(f"12/{n_steps} 广度湖扫（较慢）…", 12, n_steps)
             detail["high_low_lake"] = ingest_high_low_lake(con, start=high_low_start)
 
         for k, v in detail.items():
@@ -423,9 +561,11 @@ def update_dp_cycle_db(
                 ok = False
         log_run(con, mode=mode, ok=ok, detail=str({k: (v.get("wrote") if isinstance(v, dict) else v) for k, v in detail.items()}))
         detail["ok"] = ok
+        _p("入库完成，组装图表…", n_steps, n_steps)
         return detail
     except Exception as exc:  # noqa: BLE001
         log_run(con, mode=mode, ok=False, detail=f"{type(exc).__name__}: {exc}")
+        print(f"[dp_cycle] 入库失败: {type(exc).__name__}: {exc}", flush=True)
         raise
     finally:
         con.close()

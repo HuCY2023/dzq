@@ -837,6 +837,12 @@ button.q-badge {
   display: flex;
   gap: 6px;
   align-items: center;
+  flex-wrap: wrap;
+  max-width: calc(100% - 16px);
+}
+
+.margin-toggles {
+  top: 28px;
 }
 
 .ov-tog {
@@ -857,6 +863,13 @@ button.q-badge {
   accent-color: var(--accent);
   cursor: pointer;
 }
+
+.ov-tog[data-mg="all"] { border-color: #9270ca; color: #c4b0e8; }
+.ov-tog[data-mg="main"] { border-color: #5b8ff8; color: #9bb8f5; }
+.ov-tog[data-mg="sz"] { border-color: #5ad8a6; color: #9be8c8; }
+.ov-tog[data-mg="star"] { border-color: #f6bd16; color: #f5d67a; }
+.ov-tog[data-mg="chinext"] { border-color: #e8684a; color: #f0a090; }
+.ov-tog.is-off { opacity: 0.45; }
 
 
 .pane-label {

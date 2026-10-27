@@ -171,7 +171,14 @@
       <div class="pane-empty hidden">暂无郭嘉队ETF份额</div>
     </section>
     <section class="pane" id="pane-margin" data-series="margin">
-      <div class="pane-label">03 融资余额（亿）</div>
+      <div class="pane-label">03 融资余额（亿）· 全市场 + 分板</div>
+      <div class="overlay-toggles margin-toggles" id="marginToggles">
+        <label class="ov-tog" data-mg="all"><input type="checkbox" id="togMgAll" checked /> 全市场</label>
+        <label class="ov-tog" data-mg="main"><input type="checkbox" id="togMgMain" checked /> 主板</label>
+        <label class="ov-tog" data-mg="sz"><input type="checkbox" id="togMgSz" checked /> 深市</label>
+        <label class="ov-tog" data-mg="star"><input type="checkbox" id="togMgStar" checked /> 科创板</label>
+        <label class="ov-tog" data-mg="chinext"><input type="checkbox" id="togMgChinext" checked /> 创业板</label>
+      </div>
       <div class="chart" id="chart-margin"></div>
       <div class="pane-empty hidden">暂无两融</div>
     </section>

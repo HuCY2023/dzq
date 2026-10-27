@@ -55,15 +55,40 @@ def db_path() -> str:
     return os.path.join(root, "dp_cycle.duckdb")
 
 
-def connect(*, read_only: bool = False) -> DuckDBPyConnection:
+def connect(*, read_only: bool = False, retries: int = 8, retry_delay: float = 0.6) -> DuckDBPyConnection:
+    """打开 DuckDB；文件被占用时短暂重试（GUI 更新与后台读库常撞车）。"""
+    import time
+
     duckdb = _duckdb()
     path = db_path()
-    if read_only and not os.path.isfile(path):
-        # 空库时只读会失败，改写模式建库
-        con = duckdb.connect(path)
-        init_schema(con)
-        return con
-    return duckdb.connect(path, read_only=read_only and os.path.isfile(path))
+    last_exc: Exception | None = None
+    for attempt in range(max(1, int(retries))):
+        try:
+            if read_only and not os.path.isfile(path):
+                # 空库时只读会失败，改写模式建库
+                con = duckdb.connect(path)
+                init_schema(con)
+                return con
+            return duckdb.connect(path, read_only=read_only and os.path.isfile(path))
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            msg = str(exc)
+            locked = (
+                "另一个程序正在使用此文件" in msg
+                or "being used by another process" in msg.lower()
+                or "Cannot open file" in msg
+            )
+            if not locked or attempt + 1 >= retries:
+                if locked:
+                    raise RuntimeError(
+                        "大周期库正被占用（可能上次「更新入库」尚未结束）。"
+                        "请等状态栏完成，或关掉其它打开该库的进程后重试。"
+                        f"\n原始错误: {exc}"
+                    ) from exc
+                raise
+            time.sleep(float(retry_delay) * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
 
 
 def init_schema(con: DuckDBPyConnection) -> None:
@@ -117,7 +142,11 @@ def init_schema(con: DuckDBPyConnection) -> None:
             financing_yi DOUBLE,
             margin_total_yi DOUBLE,
             pct_all DOUBLE,
-            pct_5y DOUBLE
+            pct_5y DOUBLE,
+            sh_main_yi DOUBLE,
+            sz_main_yi DOUBLE,
+            chinext_yi DOUBLE,
+            star_yi DOUBLE
         );
         CREATE TABLE IF NOT EXISTS growth_value_daily (
             date DATE PRIMARY KEY,
@@ -186,6 +215,10 @@ def init_schema(con: DuckDBPyConnection) -> None:
         "ALTER TABLE main_force_daily ADD COLUMN IF NOT EXISTS mid_yi DOUBLE",
         "ALTER TABLE main_force_daily ADD COLUMN IF NOT EXISTS large_yi DOUBLE",
         "ALTER TABLE main_force_daily ADD COLUMN IF NOT EXISTS super_yi DOUBLE",
+        "ALTER TABLE margin_daily ADD COLUMN IF NOT EXISTS sh_main_yi DOUBLE",
+        "ALTER TABLE margin_daily ADD COLUMN IF NOT EXISTS sz_main_yi DOUBLE",
+        "ALTER TABLE margin_daily ADD COLUMN IF NOT EXISTS chinext_yi DOUBLE",
+        "ALTER TABLE margin_daily ADD COLUMN IF NOT EXISTS star_yi DOUBLE",
     ):
         try:
             con.execute(stmt)
@@ -525,15 +558,38 @@ def load_from_db(
                 etf_hist.groupby("date", as_index=False)["份额_亿份"].sum().sort_values("date")
             )
 
-        margin = con.execute(
-            """
-            SELECT date, financing_yi AS 融资余额_亿元,
-                   margin_total_yi AS 两融余额_亿元,
-                   pct_all AS 分位_全样本, pct_5y AS 分位_近N年
-            FROM margin_daily WHERE date >= ? ORDER BY date
-            """,
-            [start_ts],
-        ).df()
+        try:
+            margin = con.execute(
+                """
+                SELECT date, financing_yi AS 融资余额_亿元,
+                       margin_total_yi AS 两融余额_亿元,
+                       pct_all AS 分位_全样本, pct_5y AS 分位_近N年,
+                       sh_main_yi AS 沪主板_亿元,
+                       sz_main_yi AS 深主板_亿元,
+                       chinext_yi AS 创业板_亿元,
+                       star_yi AS 科创板_亿元,
+                       (COALESCE(sh_main_yi, 0) + COALESCE(sz_main_yi, 0)) AS 主板_亿元,
+                       (COALESCE(sz_main_yi, 0) + COALESCE(chinext_yi, 0)) AS 深市_亿元
+                FROM margin_daily WHERE date >= ? ORDER BY date
+                """,
+                [start_ts],
+            ).df()
+            # 无分板日：主板/深市置空，避免 COALESCE 把缺数写成 0
+            if not margin.empty and "沪主板_亿元" in margin.columns:
+                miss = margin["沪主板_亿元"].isna()
+                for col in ("主板_亿元", "深市_亿元"):
+                    if col in margin.columns:
+                        margin.loc[miss, col] = pd.NA
+        except Exception:
+            margin = con.execute(
+                """
+                SELECT date, financing_yi AS 融资余额_亿元,
+                       margin_total_yi AS 两融余额_亿元,
+                       pct_all AS 分位_全样本, pct_5y AS 分位_近N年
+                FROM margin_daily WHERE date >= ? ORDER BY date
+                """,
+                [start_ts],
+            ).df()
 
         gv = con.execute(
             """

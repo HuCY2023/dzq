@@ -3,22 +3,33 @@
 
 主存口径：沪+深「融资余额」合计（亿元）。不强制绑定单一商业终端；
 入库时用交易所汇总 / 东财市场表做交叉验证，稳定性写入 meta。
+
+分板（副图叠加，不影响打分主序列）：
+  按个股明细代码段汇总 → 沪主板 / 深主板 / 创业板 / 科创板（原子列），
+  展示层再合成「主板」(沪+深主板)、「深市」(深主板+创业)。
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import time
 import urllib.parse
 import urllib.request
-from typing import Any
+from typing import Any, Iterable
 
 import pandas as pd
 
 from data_source.dp_cycle._http import call_with_retry, ensure_http
 
+logger = logging.getLogger(__name__)
+
 # 近端交叉验证：相对偏差超过该阈值则记 warn（不阻断入库）
 _XCHECK_REL_WARN_PCT = 1.0
 _XCHECK_RECENT_DAYS = 60
+
+# 展示层四板（与用户口径一致；主板/深市与创业有重叠属预期）
+BOARD_DISPLAY = ("主板", "深市", "科创板", "创业板")
 
 
 def _to_yi(series: pd.Series) -> pd.Series:
@@ -370,4 +381,180 @@ def enrich_margin(df: pd.DataFrame, *, lookback_years: int = 5) -> pd.DataFrame:
     monthly = x.groupby("month", as_index=False).tail(1).copy()
     monthly["月变化_亿元"] = monthly["融资余额_亿元"].diff()
     x = x.merge(monthly[["date", "月变化_亿元"]], on="date", how="left")
+    return x
+
+
+def classify_margin_code(code: Any) -> str:
+    """个股代码 → 板：sh_main / sz_main / chinext / star / other（ETF/债等）。"""
+    c = str(code or "").split(".")[0].strip().zfill(6)
+    if not c.isdigit():
+        return "other"
+    if c.startswith("688"):
+        return "star"
+    if c.startswith(("300", "301")):
+        return "chinext"
+    if c.startswith("60"):
+        return "sh_main"
+    if c.startswith(("000", "001", "002", "003")):
+        return "sz_main"
+    return "other"
+
+
+def _board_empty_row(day: pd.Timestamp) -> dict[str, Any]:
+    return {
+        "date": pd.Timestamp(day).normalize(),
+        "沪主板_亿元": float("nan"),
+        "深主板_亿元": float("nan"),
+        "创业板_亿元": float("nan"),
+        "科创板_亿元": float("nan"),
+        "主板_亿元": float("nan"),
+        "深市_亿元": float("nan"),
+    }
+
+
+def aggregate_margin_boards_from_details(
+    sse: pd.DataFrame | None, szse: pd.DataFrame | None, *, day: pd.Timestamp
+) -> dict[str, Any]:
+    """把沪/深个股明细汇总成板余额（亿元）。不含 ETF 等 other。"""
+    buckets = {"sh_main": 0.0, "sz_main": 0.0, "chinext": 0.0, "star": 0.0}
+    n = 0
+    if sse is not None and not sse.empty:
+        code_col = "标的证券代码" if "标的证券代码" in sse.columns else sse.columns[1]
+        ye_col = "融资余额" if "融资余额" in sse.columns else None
+        if ye_col:
+            codes = sse[code_col].map(classify_margin_code)
+            ye = pd.to_numeric(sse[ye_col], errors="coerce").fillna(0.0)
+            for key in buckets:
+                buckets[key] += float(ye[codes == key].sum())
+            n += int(len(sse))
+    if szse is not None and not szse.empty:
+        code_col = "证券代码" if "证券代码" in szse.columns else szse.columns[0]
+        ye_col = "融资余额" if "融资余额" in szse.columns else None
+        if ye_col:
+            codes = szse[code_col].map(classify_margin_code)
+            ye = pd.to_numeric(szse[ye_col], errors="coerce").fillna(0.0)
+            for key in buckets:
+                buckets[key] += float(ye[codes == key].sum())
+            n += int(len(szse))
+    # 交易所明细单位为元
+    sh_m = buckets["sh_main"] / 1e8
+    sz_m = buckets["sz_main"] / 1e8
+    cx = buckets["chinext"] / 1e8
+    star = buckets["star"] / 1e8
+    return {
+        "date": pd.Timestamp(day).normalize(),
+        "沪主板_亿元": sh_m,
+        "深主板_亿元": sz_m,
+        "创业板_亿元": cx,
+        "科创板_亿元": star,
+        "主板_亿元": sh_m + sz_m,
+        "深市_亿元": sz_m + cx,
+        "_detail_n": n,
+    }
+
+
+def fetch_margin_boards_one_day(day: pd.Timestamp | str) -> dict[str, Any]:
+    """单日：AkShare 沪/深融资融券明细 → 分板。"""
+    import akshare as ak
+
+    ts = pd.Timestamp(day).normalize()
+    d = ts.strftime("%Y%m%d")
+    try:
+        sse = call_with_retry(ak.stock_margin_detail_sse, date=d, retries=2, delay=1.0)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("margin boards SSE %s: %s", d, exc)
+        sse = pd.DataFrame()
+    try:
+        szse = call_with_retry(ak.stock_margin_detail_szse, date=d, retries=2, delay=1.0)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("margin boards SZSE %s: %s", d, exc)
+        szse = pd.DataFrame()
+    if (sse is None or sse.empty) and (szse is None or szse.empty):
+        row = _board_empty_row(ts)
+        row["ok"] = False
+        return row
+    row = aggregate_margin_boards_from_details(sse, szse, day=ts)
+    row["ok"] = True
+    return row
+
+
+def select_board_fetch_dates(
+    margin_dates: Iterable,
+    have_dates: Iterable,
+    *,
+    max_days: int = 120,
+    recent_calendar_days: int = 90,
+) -> list[pd.Timestamp]:
+    """缺板日期：近端全日补齐，更早只取周五（对齐周图）；最新优先。"""
+    if max_days <= 0:
+        return []
+    md = sorted({pd.Timestamp(d).normalize() for d in margin_dates if pd.notna(d)})
+    if not md:
+        return []
+    have = {pd.Timestamp(d).normalize() for d in have_dates if pd.notna(d)}
+    missing = [d for d in md if d not in have]
+    if not missing:
+        return []
+    cutoff = md[-1] - pd.Timedelta(days=int(recent_calendar_days))
+    recent = [d for d in missing if d >= cutoff]
+    older_fri = [d for d in missing if d < cutoff and int(d.weekday()) == 4]
+    ordered = sorted(recent, reverse=True) + sorted(older_fri, reverse=True)
+    return ordered[: int(max_days)]
+
+
+def fetch_margin_boards_for_dates(
+    dates: Iterable,
+    *,
+    sleep_s: float = 0.35,
+    progress_cb: Any | None = None,
+) -> pd.DataFrame:
+    """批量拉分板；失败日跳过（不写 NaN 行，留给下次补）。"""
+    cols = [
+        "date",
+        "沪主板_亿元",
+        "深主板_亿元",
+        "创业板_亿元",
+        "科创板_亿元",
+        "主板_亿元",
+        "深市_亿元",
+    ]
+    rows: list[dict[str, Any]] = []
+    uniq = sorted({pd.Timestamp(d).normalize() for d in dates if pd.notna(d)})
+    total = len(uniq)
+    for i, day in enumerate(uniq):
+        if progress_cb is not None:
+            try:
+                progress_cb(
+                    i + 1,
+                    max(total, 1),
+                    f"融资分板 {day.date()} ({i + 1}/{total})",
+                )
+            except Exception:
+                pass
+        row = fetch_margin_boards_one_day(day)
+        if row.get("ok"):
+            rows.append({k: row[k] for k in cols})
+        if sleep_s > 0 and i + 1 < len(uniq):
+            time.sleep(sleep_s)
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    out = pd.DataFrame(rows).drop_duplicates("date").sort_values("date")
+    return out.reset_index(drop=True)
+
+
+def attach_display_boards(df: pd.DataFrame) -> pd.DataFrame:
+    """若仅有原子列，补主板/深市展示列。"""
+    if df is None or df.empty:
+        return df
+    x = df.copy()
+    if "沪主板_亿元" in x.columns and "深主板_亿元" in x.columns:
+        if "主板_亿元" not in x.columns:
+            x["主板_亿元"] = pd.to_numeric(x["沪主板_亿元"], errors="coerce") + pd.to_numeric(
+                x["深主板_亿元"], errors="coerce"
+            )
+    if "深主板_亿元" in x.columns and "创业板_亿元" in x.columns:
+        if "深市_亿元" not in x.columns:
+            x["深市_亿元"] = pd.to_numeric(x["深主板_亿元"], errors="coerce") + pd.to_numeric(
+                x["创业板_亿元"], errors="coerce"
+            )
     return x

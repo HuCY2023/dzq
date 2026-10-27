@@ -60,6 +60,8 @@
     paneSeries: [],
     /** @type {{margin:any, etf:any}|null} */
     weeklyOverlaySeries: null,
+    /** @type {Record<string,{series:any,points:any[],togId:string,label:string}>|null} */
+    marginBoardSeries: null,
   };
 
   function el(id) {
@@ -200,6 +202,79 @@
         wrap.chart.__overlays = bits;
       }
     } catch (_) {}
+  }
+
+  function applyMarginBoardToggles() {
+    const bag = state.marginBoardSeries;
+    if (!bag) return;
+    const visible = [];
+    Object.keys(bag).forEach((key) => {
+      const item = bag[key];
+      const on = !!(el(item.togId) && el(item.togId).checked);
+      try {
+        item.series.applyOptions({ visible: on });
+      } catch (_) {}
+      const lab = document.querySelector('#marginToggles .ov-tog[data-mg="' + key + '"]');
+      if (lab) lab.classList.toggle("is-off", !on);
+      if (on) visible.push(item);
+    });
+    const wrap = state.charts.find((w) => w.chart && w.chart.__label === "融资");
+    if (wrap && wrap.chart) {
+      if (visible.length) {
+        wrap.chart.__primarySeries = visible[0].series;
+        wrap.chart.__dataCache = visible[0].cache || [];
+        wrap.chart.__overlays = visible.slice(1).map((v) => ({ label: v.label, cache: v.cache }));
+      } else {
+        wrap.chart.__dataCache = [];
+        wrap.chart.__overlays = [];
+      }
+    }
+    try {
+      forceAllPriceAutoscale();
+    } catch (_) {}
+  }
+
+  function makeMarginBoardAutoscale(chart, opts) {
+    const padRatio = (opts && opts.pad) || 0.1;
+    return function autoscaleInfoProvider() {
+      const bag = state.marginBoardSeries;
+      if (!bag) return null;
+      const sets = [];
+      Object.keys(bag).forEach((key) => {
+        const item = bag[key];
+        const on = !!(el(item.togId) && el(item.togId).checked);
+        if (on && item.points && item.points.length) sets.push(item.points);
+      });
+      if (!sets.length) return null;
+      let from = 0;
+      let to = Math.max.apply(
+        null,
+        sets.map((p) => p.length)
+      ) - 1;
+      try {
+        const lr = chart.timeScale().getVisibleLogicalRange();
+        if (lr && Number.isFinite(lr.from) && Number.isFinite(lr.to)) {
+          from = Math.max(0, Math.floor(lr.from));
+          to = Math.min(to, Math.ceil(lr.to));
+        }
+      } catch (_) {}
+      let lo = Infinity;
+      let hi = -Infinity;
+      sets.forEach((points) => {
+        const b = Math.min(to, points.length - 1);
+        for (let i = Math.max(0, from); i <= b; i++) {
+          const p = points[i];
+          if (!p) continue;
+          const v = p.value != null ? +p.value : NaN;
+          if (!Number.isFinite(v)) continue;
+          lo = Math.min(lo, v);
+          hi = Math.max(hi, v);
+        }
+      });
+      if (!(Number.isFinite(lo) && Number.isFinite(hi) && hi >= lo)) return null;
+      const pad = (hi - lo) * padRatio || Math.abs(hi) * 0.05 || 1;
+      return { priceRange: { minValue: lo - pad, maxValue: hi + pad } };
+    };
   }
 
   function scrollPane(paneId) {
@@ -1106,6 +1181,8 @@
     state.charts = [];
     state.lastRange = null;
     state.lastLogical = null;
+    state.weeklyOverlaySeries = null;
+    state.marginBoardSeries = null;
   }
 
   function render(payload) {
@@ -1202,7 +1279,7 @@
       "etf",
       data
     );
-    setPaneCoverage("pane-margin", "03 融资余额（亿）", "margin", data);
+    setPaneCoverage("pane-margin", "03 融资余额（亿）· 全市场 + 分板", "margin", data);
     setPaneCoverage("pane-gv", "04 成长/价值偏离", "growth_value", data);
     setPaneCoverage(
       "pane-hl",
@@ -1441,12 +1518,40 @@
     const c3 = createChart("chart-margin", { showTimeAxis: false });
     if (c3) c3.__label = "融资";
     if (c3) {
-      const mg = c3.addLineSeries({ color: "#9270ca", lineWidth: 2 });
-      const mgPts = padToAnchors(mapLine(marginRows, "value"), anchors, 10);
-      mg.setData(mgPts);
-      bindVisibleAutoscale(c3, mg, mgPts, { pad: 0.1 });
-      cacheSeries(c3, mg, mgPts);
-      registerPaneSeries("pane-margin", mgPts);
+      const MG_SPECS = [
+        { key: "all", field: "value", color: "#9270ca", width: 2, togId: "togMgAll", label: "全市场" },
+        { key: "main", field: "main", color: "#5b8ff8", width: 1, togId: "togMgMain", label: "主板" },
+        { key: "sz", field: "sz", color: "#5ad8a6", width: 1, togId: "togMgSz", label: "深市" },
+        { key: "star", field: "star", color: "#f6bd16", width: 1, togId: "togMgStar", label: "科创板" },
+        { key: "chinext", field: "chinext", color: "#e8684a", width: 1, togId: "togMgChinext", label: "创业板" },
+      ];
+      const bag = {};
+      MG_SPECS.forEach((spec) => {
+        const ser = c3.addLineSeries({ color: spec.color, lineWidth: spec.width });
+        const pts = padToAnchors(mapLine(marginRows, spec.field), anchors, 10);
+        ser.setData(pts);
+        const cache = (pts || [])
+          .filter((p) => p.time != null && Number.isFinite(+p.value))
+          .map((p) => ({ time: p.time, value: +p.value }));
+        bag[spec.key] = {
+          series: ser,
+          points: pts,
+          cache: cache,
+          togId: spec.togId,
+          label: spec.label,
+        };
+      });
+      state.marginBoardSeries = bag;
+      const provider = makeMarginBoardAutoscale(c3, { pad: 0.1 });
+      Object.keys(bag).forEach((k) => {
+        try {
+          bag[k].series.applyOptions({ autoscaleInfoProvider: provider });
+          bag[k].series.priceScale().applyOptions({ autoScale: true });
+        } catch (_) {}
+      });
+      cacheSeries(c3, bag.all.series, bag.all.points);
+      registerPaneSeries("pane-margin", bag.all.points);
+      applyMarginBoardToggles();
     }
 
     const c4 = createChart("chart-gv", { showTimeAxis: false });
@@ -1625,6 +1730,11 @@
   ["togMargin", "togEtf"].forEach((id) => {
     const node = el(id);
     if (node) node.addEventListener("change", applyOverlayToggles);
+  });
+
+  ["togMgAll", "togMgMain", "togMgSz", "togMgStar", "togMgChinext"].forEach((id) => {
+    const node = el(id);
+    if (node) node.addEventListener("change", applyMarginBoardToggles);
   });
 
   window.renderDpCycle = render;
