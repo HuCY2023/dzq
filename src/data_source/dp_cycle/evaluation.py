@@ -10,7 +10,7 @@ import pandas as pd
 
 DEFAULT_ONE_WAY_COST = 0.0005
 _OMISSIONS = [
-    "趋势、波动率及相近股票暴露基准尚未实现。",
+    "平均股票暴露匹配使用整个评估期的事后结果，只是描述性对照。",
     "递进分区、隔离期、预警标签和单项消融尚未实现，不能视为完整有效性验证。",
     "来源和复权凭证由调用方提供，程序不独立认证其真实性。",
     "可成交状态由输入提供，按连续份额计算，未单独模拟整手、涨跌停、滑点及成交容量。",
@@ -44,7 +44,7 @@ def _block(*reasons: str) -> dict[str, Any]:
 
 
 def _evaluate_strategy(
-    prices: pd.DataFrame, signals: pd.DataFrame, *, policy: str, cost: float,
+    prices: pd.DataFrame, signals: pd.DataFrame, *, policy: str, cost: float, fixed_target: float = 0.5,
 ) -> dict[str, Any]:
     cash, units, signal_index = 1.0, 0.0, 0
     pending: dict[str, Any] | None = None
@@ -77,7 +77,7 @@ def _evaluate_strategy(
             elif policy == "buy_hold" and not started:
                 target = 1.0
             elif policy == "fixed_50":
-                target = 0.5
+                target = fixed_target
         traded, charge = 0.0, 0.0
         if target is not None:
             desired_difference = target * before - asset
@@ -126,6 +126,31 @@ def _evaluate_strategy(
     return {"daily": rows, "trades": trades, "metrics": metrics,
             "unfilled_signal": unfilled, "cancelled_signals": cancelled_signals,
             "unknown_signals": unknown_signals}
+
+
+def _baseline_signals(prices: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """只在可成交开盘后形成基准信号；下一可成交开盘才能执行。"""
+    opens: list[float] = []
+    rows: dict[str, list[dict[str, Any]]] = {"trend_20": [], "volatility_20": []}
+    tradable = prices.loc[prices["tradable"]]
+    if tradable.empty:
+        return {name: pd.DataFrame() for name in rows}
+    last_open = tradable["date"].iloc[-1] + pd.Timedelta(hours=9, minutes=30)
+    for bar in tradable.itertuples(index=False):
+        opens.append(float(bar.total_return_open))
+        timestamp = pd.Timestamp(bar.date) + pd.Timedelta(hours=9, minutes=31)
+        if timestamp >= last_open:
+            break
+        if len(opens) >= 20:
+            target = float(opens[-1] > float(np.mean(opens[-20:])))
+            rows["trend_20"].append({"signal_at": timestamp, "available_at": timestamp, "target_equity": target})
+        if len(opens) >= 21:
+            recent = np.asarray(opens[-21:], dtype=float)
+            returns = recent[1:] / recent[:-1] - 1.0
+            volatility = float(np.std(returns, ddof=1) * np.sqrt(252))
+            target = min(1.0, 0.15 / volatility) if volatility > 0 else 1.0
+            rows["volatility_20"].append({"signal_at": timestamp, "available_at": timestamp, "target_equity": target})
+    return {name: pd.DataFrame(items) for name, items in rows.items()}
 
 
 def evaluate_allocation(
@@ -196,6 +221,16 @@ def evaluate_allocation(
         return _block("本区间没有可执行的已知信号，不能把缺数当作零仓位")
     strategies = {name: _evaluate_strategy(p, s, policy=name, cost=one_way_cost)
                   for name in ("rule", "buy_hold", "fixed_50")}
+    for name, baseline in _baseline_signals(p).items():
+        if baseline.empty:
+            strategies[name] = {"status": "unavailable", "reason": "可成交开盘样本不足，无法形成并执行基准信号。"}
+        else:
+            strategies[name] = {"status": "OK", **_evaluate_strategy(p, baseline, policy="rule", cost=one_way_cost)}
+    exposure = strategies["rule"]["metrics"]["average_equity"]
+    matched = _evaluate_strategy(p, s, policy="fixed_50", cost=one_way_cost, fixed_target=exposure)
+    strategies["matched_exposure"] = {"status": "OK", "target_equity": exposure,
+                                     "note": "事后使用全期平均仓位匹配，仅供对照，不是当时可事先执行的策略。",
+                                     **matched}
     return {
         "status": "DATA_PARTIAL" if strategies["rule"]["unknown_signals"] else "OK",
         "validation_status": "not_validated", "strategies": strategies,
@@ -211,6 +246,9 @@ def evaluate_allocation(
                         "trade_value_unit": "初始净值为 1 的归一化单位，并非人民币金额",
                         "unknown_signal": "目标仓位缺失时撤销未成交指令并保留已有持仓",
                         "fixed_50": "每个可成交开盘再平衡至 50%",
+                        "trend_20": "最近20次可成交开盘价格与均值比较，信号形成后下一可成交开盘执行",
+                        "volatility_20": "最近20个可成交开盘收益年化波动，15%目标，仓位限制0–100%",
+                        "matched_exposure": "全期规则平均股票暴露的事后固定比例，仅用于描述性对照",
                         "terminal_liquidation": False, "volatility_annualization_days": 252},
         "evidence": dict(evidence), "limitations": list(_OMISSIONS),
     }
