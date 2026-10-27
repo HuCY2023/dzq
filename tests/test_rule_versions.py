@@ -23,6 +23,86 @@ def bundle_with_etf_regime(regime):
 
 
 class RuleVersionTests(unittest.TestCase):
+    def test_improved_rule_does_not_double_count_main_force_and_scissors(self):
+        bundle = core_samples("2026-10-26")
+        force = bundle["main_force_daily"]
+        force["小单_亿元"] = 100.0
+        force["中单_亿元"] = 100.0
+        prior = force["date"].between("2026-10-19", "2026-10-23")
+        force.loc[prior, "净额_亿元"] = -500.0
+        improved = diagnose_position(bundle, heavy=False, as_of="2026-10-27")
+        original = diagnose_position(bundle, heavy=False, as_of="2026-10-27", rule_version="author_v1")
+        i = next(x for x in improved["items"] if x["id"] == "scissors")
+        a = next(x for x in original["items"] if x["id"] == "scissors")
+        self.assertEqual(i["status"], "info")
+        self.assertEqual(i["score"], -1)
+        self.assertEqual(a["status"], "ok")
+        self.assertEqual(a["score"], -1)
+        no_split = dict(bundle, main_force_daily=force.drop(columns=["小单_亿元", "中单_亿元"]))
+        improved_curve = score_history_weekly(bundle, as_of="2026-10-27")
+        without_scissors = score_history_weekly(no_split, as_of="2026-10-27")
+        self.assertEqual(improved_curve, without_scissors)
+        author_curve = score_history_weekly(bundle, as_of="2026-10-27", rule_version="author_v1")
+        author_without = score_history_weekly(no_split, as_of="2026-10-27", rule_version="author_v1")
+        self.assertEqual(author_curve[-1]["value"], author_without[-1]["value"] - 1)
+
+    def test_history_does_not_carry_main_force_or_scissors_into_missing_weeks(self):
+        days = pd.bdate_range(end="2026-10-09", periods=20)
+        force = pd.DataFrame({"date": days, "净额_亿元": -500.0, "中单_亿元": 100.0, "小单_亿元": 100.0})
+        weekly = pd.DataFrame({"date": pd.to_datetime(["2026-10-09", "2026-10-16", "2026-10-23"]), "close": 100.0})
+        bundle = {"weekly": weekly, "main_force_daily": force}
+        for version, expected in (("improved_v1", -2), ("author_v1", -3)):
+            with self.subTest(version=version):
+                curve = score_history_weekly(bundle, as_of="2026-10-23", rule_version=version)
+                self.assertEqual(curve, [{"time": "2026-10-09", "value": expected}])
+
+    def test_history_resumes_with_new_main_force_but_not_old_scissors(self):
+        first = pd.bdate_range(end="2026-10-09", periods=20)
+        resumed = pd.bdate_range("2026-10-19", "2026-10-23")
+        force = pd.DataFrame({"date": first.append(resumed), "净额_亿元": -500.0,
+                              "中单_亿元": [100.0] * len(first) + [float("nan")] * len(resumed),
+                              "小单_亿元": [100.0] * len(first) + [float("nan")] * len(resumed)})
+        weekly = pd.DataFrame({"date": pd.to_datetime(["2026-10-09", "2026-10-16", "2026-10-23"]), "close": 100.0})
+        bundle = {"weekly": weekly, "main_force_daily": force}
+        improved = score_history_weekly(bundle, as_of="2026-10-23", rule_version="improved_v1")
+        author = score_history_weekly(bundle, as_of="2026-10-23", rule_version="author_v1")
+        self.assertEqual(improved, [{"time": "2026-10-09", "value": -2}, {"time": "2026-10-23", "value": -2}])
+        self.assertEqual(author, [{"time": "2026-10-09", "value": -3}, {"time": "2026-10-23", "value": -2}])
+
+    def test_future_main_force_row_cannot_satisfy_twenty_day_history_gate(self):
+        days = pd.bdate_range(end="2026-10-09", periods=19)
+        force = pd.DataFrame({"date": days, "净额_亿元": -500.0, "中单_亿元": 100.0, "小单_亿元": 100.0})
+        future = pd.DataFrame({"date": [pd.Timestamp("2026-10-12")], "净额_亿元": [-500.0],
+                               "中单_亿元": [100.0], "小单_亿元": [100.0]})
+        weekly = pd.DataFrame({"date": [pd.Timestamp("2026-10-09")], "close": [100.0]})
+        for version in ("improved_v1", "author_v1"):
+            with self.subTest(version=version):
+                earlier = score_history_weekly({"weekly": weekly, "main_force_daily": force},
+                                               as_of="2026-10-09", rule_version=version)
+                extended = score_history_weekly({"weekly": weekly, "main_force_daily": pd.concat([force, future])},
+                                                as_of="2026-10-09", rule_version=version)
+                self.assertEqual(earlier, [])
+                self.assertEqual(extended, earlier)
+
+    def test_history_keeps_a_real_zero_but_omits_the_following_missing_week(self):
+        days = pd.bdate_range(end="2026-10-09", periods=20)
+        force = pd.DataFrame({"date": days, "净额_亿元": 0.0})
+        weekly = pd.DataFrame({"date": pd.to_datetime(["2026-10-09", "2026-10-16"]), "close": 100.0})
+        for version in ("improved_v1", "author_v1"):
+            with self.subTest(version=version):
+                curve = score_history_weekly({"weekly": weekly, "main_force_daily": force},
+                                             as_of="2026-10-16", rule_version=version)
+                self.assertEqual(curve, [{"time": "2026-10-09", "value": 0}])
+
+    def test_history_keeps_other_valid_evidence_when_main_force_week_is_missing(self):
+        days = pd.bdate_range(end="2026-10-09", periods=20)
+        force = pd.DataFrame({"date": days, "净额_亿元": -500.0})
+        weekly = pd.DataFrame({"date": pd.to_datetime(["2026-10-09", "2026-10-16"]), "close": 100.0})
+        divergence = pd.DataFrame({"date": [pd.Timestamp("2026-10-16")], "偏离度": [20.0]})
+        bundle = {"weekly": weekly, "main_force_daily": force, "growth_value": divergence}
+        curve = score_history_weekly(bundle, as_of="2026-10-16")
+        self.assertEqual(curve, [{"time": "2026-10-09", "value": -2}, {"time": "2026-10-16", "value": -1}])
+
     def test_default_high_etf_outflow_does_not_force_exit(self):
         diagnosis = diagnose_position(bundle_with_etf_regime("high_out"), heavy=False, as_of="2026-10-27")
         self.assertEqual(diagnosis["decision"]["id"], "hold")

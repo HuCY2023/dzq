@@ -16,7 +16,7 @@ class Element {
 
 const names = ["diagState", "diagScore", "scoreBig", "scoreLogic", "scoreSumBar",
   "scoreFormula", "scoreTableBody", "scoreBoardHint", "layersHost", "currentWeek", "empty",
-  "redLightGrid", "redLightHint", "redLightNote", "analysisDate"];
+  "redLightGrid", "redLightHint", "redLightNote", "analysisDate", "etfFlowText"];
 const elements = Object.fromEntries(names.map((name) => [name, new Element()]));
 const document = {
   getElementById: (name) => elements[name] || null,
@@ -29,7 +29,9 @@ vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../web/dp_cycle/app.js"
   setTimeout: () => 1, clearTimeout() {}, console,
 });
 
-window.renderDpCycle({ diagnosis: {
+window.renderDpCycle({ etf_flow: {status: "partial", date: "2026-10-26", flow_yi: 217.1622, source: {events_recorded: false},
+  coverage: {comparable: 4, expected: 4}, reason: "截至日覆盖未知",
+  components: [{code: "159919", flow_yi: 18.2621}]}, diagnosis: {
   score: 0,
   as_of: "2026-10-27",
   current_week: { period_end: "2026-10-30", last_observation_date: "2026-10-26",
@@ -58,6 +60,11 @@ assert.match(elements.scoreFormula.innerHTML, /美股拥挤度\(观察\)/);
 assert.match(elements.scoreBoardHint.textContent, /仅观察.*美股拥挤度/);
 assert.match(elements.currentWeek.textContent, /2026-10-26.*1.*交易日.*未结束/);
 assert.match(elements.analysisDate.textContent, /分析日期.*2026-10-27/);
+assert.match(elements.etfFlowText.textContent, /2026-10-26.*4\/4.*217\.16/);
+assert.match(elements.etfFlowText.textContent, /截至日覆盖未知/);
+assert.match(elements.etfFlowText.textContent, /估算.*非.*现金流/);
+assert.match(elements.etfFlowText.textContent, /事件表.*未留存/);
+assert.match(elements.etfFlowText.textContent, /手动.*导入/);
 assert.match(elements.redLightGrid.children[0].innerHTML, />未知</);
 assert.match(elements.redLightGrid.children[1].innerHTML, />灭</);
 assert.match(elements.redLightHint.textContent, /已知 1\/4/);

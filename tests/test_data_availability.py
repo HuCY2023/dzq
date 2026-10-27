@@ -7,7 +7,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from data_source.dp_cycle.diagnosis import diagnose_position
+from data_source.dp_cycle.diagnosis import _as_pct, diagnose_position
 from data_source.dp_cycle.national_team_etf import monthly_share_change
 
 
@@ -27,7 +27,7 @@ def core_samples(last_day):
         "weekly": pd.DataFrame({"date": [last_friday], "close": [100.0]}),
         "margin": pd.DataFrame({
             "date": days,
-            "融资余额_亿元": range(1000, 1040),
+            "融资余额_亿元": list(range(1000, 1039)) + [1020],
             "分位_全样本": [50.0] * 40,
         }),
         "main_force_daily": pd.DataFrame({"date": days, "净额_亿元": [0.0] * 40}),
@@ -119,6 +119,7 @@ class DataAvailabilityTests(unittest.TestCase):
     def test_missing_margin_percentile_is_not_a_neutral_score(self):
         self.assertIn("as_of", signature(diagnose_position).parameters)
         bundle = core_samples("2026-10-26")
+        bundle["margin"] = bundle["margin"].tail(24).copy()
         bundle["margin"]["分位_全样本"] = float("nan")
         diagnosis = diagnose_position(bundle, heavy=False, as_of="2026-10-27")
         margin = next(item for item in diagnosis["items"] if item["id"] == "margin")
@@ -127,12 +128,15 @@ class DataAvailabilityTests(unittest.TestCase):
         self.assert_no_position(diagnosis)
 
     def test_margin_percentile_is_already_in_percent_units(self):
+        self.assertEqual(_as_pct(0.75), 0.75)
+
+    def test_missing_stored_percentile_is_recomputed_when_balances_are_sufficient(self):
         bundle = core_samples("2026-10-26")
-        bundle["margin"]["分位_全样本"] = 0.75
+        bundle["margin"]["分位_全样本"] = float("nan")
         result = diagnose_position(bundle, heavy=False, as_of="2026-10-27")
         item = next(i for i in result["items"] if i["id"] == "margin")
-        self.assertEqual(item["pct"], 0.75)
-        self.assertEqual(item["zone"], "low")
+        self.assertEqual(item["status"], "ok")
+        self.assertAlmostEqual(item["pct"], 53.75)
 
     def test_latest_missing_margin_balance_is_partial(self):
         bundle = core_samples("2026-10-26")

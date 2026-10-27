@@ -409,7 +409,7 @@ class MarginCompletenessTests(unittest.TestCase):
             ingest_margin(con, cross_check=False, board_max_days=0)
         rows = con.execute("SELECT financing_yi, pct_all FROM margin_daily ORDER BY date").fetchall()
         self.assertEqual([row[0] for row in rows], [1, 2, 3, 3, 5, 10])
-        self.assertAlmostEqual(rows[3][1], 100 * 3.5 / 6)
+        self.assertAlmostEqual(rows[3][1], 100 * 3.5 / 4)
         self.assertEqual(rows[-1][1], 100)
 
     def test_each_missing_atomic_column_is_retried(self):
