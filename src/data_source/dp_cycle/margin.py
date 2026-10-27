@@ -415,9 +415,7 @@ def causal_margin_frame(
     if "available_at" in x.columns:
         x = x.sort_values("available_at", kind="stable", na_position="first")
     x = x.sort_values("date", kind="stable").drop_duplicates("date", keep="last").reset_index(drop=True)
-    calendar_verified = pd.Series(False, index=x.index)
-    observed_delta = x["融资余额_亿元"] - x["融资余额_亿元"].shift(20)
-    delta = observed_delta.copy()
+    positions = None
     if not x.empty and isinstance(trade_calendar, dict):
         start = pd.to_datetime(trade_calendar.get("coverage_start"), errors="coerce")
         end = pd.to_datetime(trade_calendar.get("coverage_end"), errors="coerce")
@@ -425,16 +423,21 @@ def causal_margin_frame(
             days = pd.DatetimeIndex(pd.to_datetime(trade_calendar.get("dates", []), errors="coerce")).dropna().normalize()
             days = days[(days >= start) & (days <= end)].sort_values().unique()
             positions = days.get_indexer(pd.DatetimeIndex(x["date"]))
-            calendar_verified = pd.Series(positions >= 20, index=x.index)
-            if calendar_verified.any():
-                prior_dates = days.take(positions[calendar_verified.to_numpy()] - 20)
-                prior = x.set_index("date")["融资余额_亿元"].reindex(prior_dates).to_numpy()
-                delta.loc[calendar_verified] = x.loc[calendar_verified, "融资余额_亿元"].to_numpy() - prior
     balances = x["融资余额_亿元"]
+    for interval in (5, 20):
+        delta = balances - balances.shift(interval)
+        verified = pd.Series(False, index=x.index)
+        if positions is not None:
+            verified = pd.Series(positions >= interval, index=x.index)
+            if verified.any():
+                prior_dates = days.take(positions[verified.to_numpy()] - interval)
+                prior = x.set_index("date")["融资余额_亿元"].reindex(prior_dates).to_numpy()
+                delta.loc[verified] = balances.loc[verified].to_numpy() - prior
+        x[f"融资_{interval}交易日变化_亿元"] = delta
+        x[f"融资_{interval}交易日历已核验"] = verified
     x["融资_截至当期分位"] = balances.expanding(min_periods=1).rank(pct=True) * 100.0
-    x["融资_20交易日变化_亿元"] = delta
     x["融资_有效样本数"] = balances.notna().cumsum()
-    x["融资_交易日历已核验"] = calendar_verified
+    x["融资_交易日历已核验"] = x["融资_20交易日历已核验"]
     return x
 
 
@@ -450,9 +453,12 @@ def margin_signal_from_row(row: pd.Series | None) -> dict[str, Any]:
 
     pct = float(row["融资_截至当期分位"])
     delta = float(row["融资_20交易日变化_亿元"])
+    delta_5 = row["融资_5交易日变化_亿元"]
     score, zone, trend, tag = score_margin_regime(pct, delta)
     return {"status": "ok", "date": pd.Timestamp(row["date"]), "balance": float(row["融资余额_亿元"]),
-            "pct": pct, "delta": delta, "score": score, "zone": zone, "trend": trend, "tag": tag,
+            "pct": pct, "delta": delta, "delta_5": float(delta_5) if pd.notna(delta_5) else None,
+            "calendar_verified_5": bool(row["融资_5交易日历已核验"]),
+            "score": score, "zone": zone, "trend": trend, "tag": tag,
             "calendar_verified": bool(row["融资_交易日历已核验"])}
 
 

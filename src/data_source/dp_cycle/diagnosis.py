@@ -255,15 +255,19 @@ def _margin_item(margin: pd.DataFrame, *, trade_calendar: dict[str, Any] | None 
     if signal["status"] != "ok":
         return _item("margin", "杠杆", score=None, note=signal["reason"], status=signal["status"])
     interval = "20个交易日间隔" if signal["calendar_verified"] else "20个观测日间隔（未核验交易日历）"
+    short_interval = "5个交易日间隔" if signal["calendar_verified_5"] else "5个观测日间隔（未核验交易日历）"
+    short_change = f"{signal['delta_5']:+.0f} 亿" if signal["delta_5"] is not None else "基准缺失"
     note = (f"{signal['date'].date()} 融资 {signal['balance']:.0f} 亿，"
             f"截至当期历史分位 {signal['pct']:.0f}%（{signal['zone']}），"
-            f"{interval} {signal['delta']:+.0f} 亿（{signal['trend']}）。{signal['tag']}")
+            f"{interval} {signal['delta']:+.0f} 亿（{signal['trend']}），"
+            f"{short_interval} {short_change}。{signal['tag']}")
     out = _item("margin", "杠杆", score=signal["score"], note=note, status="ok")
     out["zone"] = signal["zone"]
     out["trend"] = signal["trend"]
     out["direction"] = {"up": "in", "down": "out", "flat": "flat"}.get(signal["trend"], "flat")
     out["pct"] = signal["pct"]
     out["delta_20"] = signal["delta"]
+    out["delta_5"] = signal["delta_5"]
     return out
 
 
@@ -839,7 +843,7 @@ def score_history_weekly(
 
         # 公募新发
         ii = int(np.searchsorted(issue_w_i8, end_i8, side="right"))
-        if ii >= 2:
+        if rule_version == "author_v1" and ii >= 2:
             total += score_fund_issue(float(issue_w_v[ii - 1]), float(issue_w_v[ii - 2]))
             scored += 1
 
@@ -907,6 +911,47 @@ def _fund_issue_item(raw: pd.DataFrame | None) -> dict[str, Any]:
         note=f"{day} 当周成立 {last:.0f} 亿份，上周 {prev:.0f}。{tag}。口径是已成立，不是认购中。",
         status="ok",
     )
+
+
+def _fund_issue_observation(raw: pd.DataFrame | None, *, period_end: pd.Timestamp) -> dict[str, Any]:
+    """按基金类型列出当周已观察数据，来源完整性未证实时不计分。"""
+    from data_source.dp_cycle.fund_issue import classify_fund_issue
+
+    x = _prep(raw, ["shares_yi"])
+    if x.empty or not {"name", "fund_type", "shares_yi"}.issubset(x.columns):
+        return _item("fund_issue", "公募新发", score=None, note="缺少基金分类或成立份额", status="gap")
+    x = x.loc[(x["date"] > period_end - pd.Timedelta(days=7)) & (x["date"] <= period_end)].copy()
+    if x.empty:
+        return _item("fund_issue", "公募新发", score=None, note=f"{period_end.date()} 当周无可用记录", status="gap")
+    x["category"] = [classify_fund_issue(kind, name) for kind, name in zip(x["fund_type"], x["name"])]
+    groups: dict[str, dict[str, Any]] = {}
+    for category in ("domestic_equity_candidate", "cross_border_candidate", "qdii", "bond", "fof", "other_mixed", "money", "unknown"):
+        part = x.loc[x["category"] == category, "shares_yi"]
+        amount = part.sum(min_count=1)
+        groups[category] = {"observed": int(len(part)), "valid_shares": int(part.notna().sum()),
+                            "missing_shares": int(part.isna().sum()),
+                            "known_shares_yi": float(amount) if pd.notna(amount) else None}
+    domestic = groups["domestic_equity_candidate"]
+    amount = domestic["known_shares_yi"]
+    amount_text = f"{amount:.1f} 亿份" if amount is not None else "未观测到有效份额"
+    status = "partial" if any(group["missing_shares"] for group in groups.values()) or groups["unknown"]["observed"] else "ok"
+    details = []
+    for key, label in (("bond", "债券"), ("qdii", "QDII"), ("fof", "FOF"),
+                       ("cross_border_candidate", "跨境候选"), ("other_mixed", "其他混合"),
+                       ("money", "货币"), ("unknown", "未分类")):
+        group = groups[key]
+        if group["observed"]:
+            amount = group["known_shares_yi"]
+            value = f"{amount:.1f}亿份" if amount is not None else "未取得"
+            details.append(f"{label}{group['observed']}只（有效{group['valid_shares']}、缺{group['missing_shares']}，已知{value}）")
+    detail = "、".join(details) if details else "其他分类未观察到记录"
+    item = _item("fund_issue", "公募新发", score=None, status=status,
+                 note=(f"{period_end.date()} 当周境内偏股候选 {domestic['observed']} 只，已知份额 {amount_text}，"
+                       f"有效 {domestic['valid_shares']}、缺 {domestic['missing_shares']}；其他已观察：{detail}。"
+                       "分类仅为候选，未证明来源全量或实际建仓，仅观察不计分。"))
+    item["groups"] = groups
+    item["rule"] = "分类展示成立份额；数据完整性和资产投向未核验前仅观察，不参与改进版评分。"
+    return item
 
 
 def _holder_reduce_item(raw: pd.DataFrame | None) -> dict[str, Any]:
@@ -1224,7 +1269,8 @@ def diagnose_position(
     if author:
         nt_item["rule"] = AUTHOR_ETF_RULE
     sc_item = _scissors_item(main_force_complete)
-    fi_item = _fund_issue_item(fund_issue_complete)
+    fi_item = (_fund_issue_item(fund_issue_complete) if author else
+               _fund_issue_observation(fund_issue_complete, period_end=completed_end))
     hr_item, holder_visible = _holder_window_item(
         _prep(holder_reduce_complete, ["amount_yi"]), period_end=completed_end, as_of=cutoff,
     )
@@ -1271,6 +1317,9 @@ def diagnose_position(
     if hr_item["status"] == "partial":
         availability["holder_reduce"]["status"] = "partial"
         availability["holder_reduce"]["reason"] = hr_item["note"]
+    if fi_item["status"] == "partial":
+        availability["fund_issue"]["status"] = "partial"
+        availability["fund_issue"]["reason"] = fi_item["note"]
     if early_week and not weekly_proven:
         availability["weekly"]["status"] = "partial" if availability["weekly"]["period_end"] else "gap"
         availability["weekly"]["reason"] = "已结束短周的本周周K缺少截至分析日已可用的观测，不能以上周周K代替"
@@ -1339,6 +1388,8 @@ def diagnose_position(
         sc_item["status"] = "info"
         sc_item["rule"] = "剪刀差仅供观察；主力与剪刀差使用相关数据，改进版只对主力计分。"
         sc_item["note"] = sc_item["note"].replace("计负分", "仅供观察，不重复计分")
+    if not author and fi_item["status"] == "ok":
+        fi_item["status"] = "info"
     if div_item["status"] != "ok":
         div_shape = "gap"
     if br_item["status"] != "ok":
@@ -1686,7 +1737,7 @@ def diagnose_position(
         "日常约 ±1/±2；多项同负才极端（如 −9）。"
         "硬信号优先 → 离场/减仓/持有/加仓/抄底。未参与评分的项目不记为 0。"
         if author else
-        "融资、主力、行为和解禁等可用项参与规则；宽基ETF份额和剪刀差仅作观察。"
+        "融资、主力、行为和解禁等可用项参与规则；宽基ETF份额、剪刀差和公募新发仅作观察。"
         "未参与评分的项目不记为 0。规则尚未完成有效性验证。"
     )
 
