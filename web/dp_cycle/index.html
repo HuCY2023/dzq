@@ -22,7 +22,7 @@
           <button type="button" data-pane="pane-mf-m">主力月</button>
           <button type="button" data-pane="pane-mf-w">主力周</button>
           <button type="button" data-pane="pane-nb">北向</button>
-          <button type="button" data-pane="pane-etf">郭嘉队ETF</button>
+          <button type="button" data-pane="pane-etf">宽基ETF</button>
           <button type="button" data-pane="pane-margin">融资</button>
           <button type="button" data-pane="pane-gv">偏离</button>
           <button type="button" data-pane="pane-hl">广度</button>
@@ -41,12 +41,14 @@
       <div class="verdict-row">
         <div class="verdict-main">
           <div class="diag-kicker" id="diagFramework">散户决策</div>
+          <div class="diag-summary" id="analysisDate"></div>
           <div class="decision-label" id="decisionLabel">等待加载…</div>
           <div class="decision-equity" id="decisionEquity"></div>
           <div class="decision-why" id="decisionWhy"></div>
           <div class="decision-scale" id="decisionScale"></div>
           <div class="diag-state" id="diagState"></div>
           <div class="diag-summary" id="diagSummary"></div>
+          <div class="diag-summary" id="currentWeek"></div>
         </div>
         <div class="verdict-score" id="verdictScore">
           <div class="score-cap">汇总得分</div>
@@ -54,6 +56,27 @@
           <div class="diag-score" id="diagScore"></div>
           <div class="score-logic" id="scoreLogic"></div>
         </div>
+      </div>
+
+      <div class="fw-block">
+        <div class="fw-head">
+          <span class="fw-title">核心宽基 ETF 份额折算估计</span>
+          <span class="fw-hint">仅观察 · 不参与评分</span>
+        </div>
+        <div class="diag-summary" id="etfFlowText">尚未导入逐基金份额和净值数据。</div>
+        <div class="fw-head">
+          <span class="fw-title">已披露持有人 · 独立观察</span>
+          <span class="fw-hint">报告期与公告日分开</span>
+        </div>
+        <div class="diag-summary" id="etfHolderText">尚未核验持有人报告。</div>
+      </div>
+
+      <div class="fw-block">
+        <div class="fw-head">
+          <span class="fw-title">本地成交集中度 · 部分覆盖</span>
+          <span class="fw-hint">仅观察 · 不参与评分</span>
+        </div>
+        <div class="diag-summary" id="turnoverText">尚未导入本地成交集中度快照。</div>
       </div>
 
       <div class="fw-block score-board" id="scoreBoardBlock">
@@ -81,7 +104,7 @@
       <div class="fw-block">
         <div class="fw-head">
           <span class="fw-title">其他几路资金（速览）</span>
-          <span class="fw-hint">郭嘉队ETF仓位优先 · 融资分位×方向 · 主力</span>
+          <span class="fw-hint">宽基ETF份额代理 · 融资分位×方向 · 主力</span>
         </div>
         <div class="triple-row" id="tripleRow"></div>
         <div class="resonance" id="resonanceLine"></div>
@@ -90,7 +113,7 @@
       <div class="fw-block">
         <div class="fw-head">
           <span class="fw-title">三种系统性风险</span>
-          <span class="fw-hint">杀杠杆 · 股东退出 · 国家队退出/过热调控</span>
+          <span class="fw-hint">杀杠杆 · 股东退出 · 宽基ETF份额变化</span>
         </div>
         <div class="node-grid" id="nodeGrid"></div>
       </div>
@@ -140,13 +163,13 @@
       <div class="pane-label" id="weeklyLabel">指数周线</div>
       <div class="overlay-toggles" id="overlayToggles">
         <label class="ov-tog"><input type="checkbox" id="togMargin" checked /> 融资</label>
-        <label class="ov-tog"><input type="checkbox" id="togEtf" checked /> 郭嘉队ETF</label>
+        <label class="ov-tog"><input type="checkbox" id="togEtf" checked /> 宽基ETF</label>
       </div>
       <div class="chart" id="chart-weekly"></div>
       <div class="pane-empty hidden">暂无周线</div>
     </section>
     <section class="pane pane-score" id="pane-score" data-series="score">
-      <div class="pane-label">位置打分（−10～10）· 有数项合计，缺的不记 0</div>
+      <div class="pane-label">历史位置打分 · 事后复算，非可交易回测</div>
       <div class="chart" id="chart-score"></div>
       <div class="pane-empty hidden">暂无打分曲线</div>
     </section>
@@ -166,9 +189,9 @@
       <div class="pane-empty hidden">暂无北向（2024-08 后字段常空）</div>
     </section>
     <section class="pane" id="pane-etf" data-series="etf">
-      <div class="pane-label">02 郭嘉队ETF 份额（亿份）· 旁证≠汇金</div>
+      <div class="pane-label">02 核心宽基ETF份额（亿份）· 不能识别持有人</div>
       <div class="chart" id="chart-etf"></div>
-      <div class="pane-empty hidden">暂无郭嘉队ETF份额</div>
+      <div class="pane-empty hidden">暂无核心宽基ETF份额</div>
     </section>
     <section class="pane" id="pane-margin" data-series="margin">
       <div class="pane-label">03 融资余额（亿）· 全市场 + 分板</div>

@@ -18,6 +18,7 @@ def install_no_system_proxy_patch() -> None:
         self.trust_env = False
         kwargs.pop("trust_env", None)
         kwargs.setdefault("proxies", {"http": None, "https": None})
+        kwargs.setdefault("timeout", (10, 30))
         return _ORIG(self, method, url, **kwargs)
 
     requests.Session.request = patched

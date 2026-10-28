@@ -42,35 +42,26 @@ def _params() -> dict[str, Any]:
 
 def _parse_klines(klines: list[str]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
+    value_cols = ["净额_亿元", "小单_亿元", "中单_亿元", "大单_亿元", "超大单_亿元"]
     for line in klines or []:
         p = str(line).split(",")
-        if len(p) < 6:
+        if len(p) < 2:
             continue
-        try:
-            rows.append(
-                {
-                    "date": p[0],
-                    "净额_亿元": float(p[1]) / 1e8,
-                    "小单_亿元": float(p[2]) / 1e8,
-                    "中单_亿元": float(p[3]) / 1e8,
-                    "大单_亿元": float(p[4]) / 1e8,
-                    "超大单_亿元": float(p[5]) / 1e8,
-                }
-            )
-        except (TypeError, ValueError):
-            continue
+        fields = (p[1:6] + [""] * 5)[:5]
+        rows.append({"date": p[0], **{
+            col: pd.to_numeric(value, errors="coerce") / 1e8
+            for col, value in zip(value_cols, fields)
+        }})
     if not rows:
-        return pd.DataFrame(
-            columns=["date", "净额_亿元", "小单_亿元", "中单_亿元", "大单_亿元", "超大单_亿元"]
-        )
+        return pd.DataFrame(columns=["date", *value_cols])
     out = pd.DataFrame(rows)
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
-    out = out.dropna(subset=["date", "净额_亿元"]).sort_values("date").drop_duplicates("date")
-    return out.reset_index(drop=True)
+    out = out.dropna(subset=["date"]).dropna(subset=value_cols, how="all")
+    return out.groupby("date", sort=True)[value_cols].last().reset_index()
 
 
 def union_main_force_frames(*frames: pd.DataFrame) -> pd.DataFrame:
-    """按日期合并多份主力日频。后出现的帧覆盖同一天，更早的日期保留。"""
+    """按日期逐字段合并；后出现的非空值优先，并记录参与合并的来源。"""
     cols = [
         "date",
         "净额_亿元",
@@ -98,33 +89,55 @@ def union_main_force_frames(*frames: pd.DataFrame) -> pd.DataFrame:
     if not parts:
         return pd.DataFrame(columns=cols)
     merged = pd.concat(parts, ignore_index=True)
-    merged["净额_亿元"] = pd.to_numeric(merged["净额_亿元"], errors="coerce")
-    merged = merged.dropna(subset=["date", "净额_亿元"])
-    # sort 稳定，同日保留后一帧
-    return (
-        merged.sort_values("date", kind="mergesort")
-        .drop_duplicates("date", keep="last")
-        .reset_index(drop=True)
+    merged = merged.dropna(subset=["date"])
+    value_cols = cols[1:-1]
+    for col in value_cols:
+        merged[col] = pd.to_numeric(merged[col], errors="coerce")
+    merged["source"] = merged["source"].fillna("unknown").astype(str).str.strip().replace("", "unknown")
+    values = merged.groupby("date", sort=True)[value_cols].last()
+    origins = pd.concat(
+        [merged.loc[merged[col].notna(), ["date", "source"]].drop_duplicates("date", keep="last")
+         for col in value_cols],
+        ignore_index=True,
     )
+    def source_label(names):
+        unique = list(dict.fromkeys(names))
+        return unique[0] if len(unique) == 1 and " | " not in unique[0] else "mixed_or_unknown"
+
+    sources = origins.groupby("date")["source"].agg(source_label)
+    values["source"] = sources
+    return values.dropna(subset=value_cols, how="all").reset_index()[cols]
 
 
 def persist_em_klines(klines: list[str], path: str) -> int:
-    """把东财 kline 文本按日期并进本地 JSON。新响应只覆盖同一天，不缩短历史。"""
+    """按日期和字段合并东财 kline；新响应的空值不覆盖旧值。"""
     import os
 
     old: list[str] = []
     if os.path.isfile(path):
         try:
-            raw = json.loads(open(path, encoding="utf-8").read())
+            with open(path, encoding="utf-8") as fh:
+                raw = json.load(fh)
             old = list((raw.get("data") or {}).get("klines") or raw.get("klines") or [])
         except Exception:
             old = []
-    by_date: dict[str, str] = {}
+    by_date: dict[str, list[str]] = {}
     for line in list(old) + list(klines or []):
-        day = str(line).split(",", 1)[0].strip()
-        if day:
-            by_date[day] = str(line)
-    merged = [by_date[k] for k in sorted(by_date)]
+        fields = str(line).split(",")
+        day = fields[0].strip()
+        if not day:
+            continue
+        fields[0] = day
+        if day not in by_date:
+            by_date[day] = fields
+            continue
+        current = by_date[day]
+        for i, value in enumerate(fields[1:], start=1):
+            if i >= len(current):
+                current.append("")
+            if pd.notna(pd.to_numeric(value, errors="coerce")):
+                current[i] = value
+    merged = [",".join(by_date[k]) for k in sorted(by_date)]
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump({"data": {"klines": merged}}, fh, ensure_ascii=False)
@@ -159,7 +172,8 @@ def fetch_em_market_fund_flow(*, retries: int = 8) -> tuple[pd.DataFrame, dict[s
             meta["rows"] = int(len(df))
             meta["first_date"] = str(df["date"].iloc[0].date())
             meta["last_date"] = str(df["date"].iloc[-1].date())
-            meta["last_净额_亿元"] = float(df["净额_亿元"].iloc[-1])
+            last_net = df["净额_亿元"].iloc[-1]
+            meta["last_净额_亿元"] = float(last_net) if pd.notna(last_net) else None
             try:
                 import os
 
@@ -183,9 +197,12 @@ def load_em_fund_flow_cache(path: str) -> pd.DataFrame:
     if not os.path.isfile(path):
         return pd.DataFrame()
     if path.lower().endswith(".json"):
-        raw = json.loads(open(path, encoding="utf-8").read())
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
         klines = (raw.get("data") or {}).get("klines") or raw.get("klines") or []
-        return _parse_klines(klines)
+        out = _parse_klines(klines)
+        out["source"] = "em_market_main"
+        return out
     df = pd.read_csv(path)
     if "date" not in df.columns:
         return pd.DataFrame()
@@ -193,14 +210,19 @@ def load_em_fund_flow_cache(path: str) -> pd.DataFrame:
         "主力净流入_亿元" if "主力净流入_亿元" in df.columns else None
     )
     if col is None:
-        return pd.DataFrame()
-    out = pd.DataFrame(
-        {
-            "date": pd.to_datetime(df["date"], errors="coerce").dt.normalize(),
-            "净额_亿元": pd.to_numeric(df[col], errors="coerce"),
-        }
-    )
-    return out.dropna(subset=["date", "净额_亿元"]).sort_values("date").reset_index(drop=True)
+        df["净额_亿元"] = pd.NA
+        col = "净额_亿元"
+    out = df.rename(columns={col: "净额_亿元"}).copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+    value_cols = ("净额_亿元", "小单_亿元", "中单_亿元", "大单_亿元", "超大单_亿元",
+                  "流入_亿元", "流出_亿元", "行业数")
+    for value_col in value_cols:
+        if value_col in out.columns:
+            out[value_col] = pd.to_numeric(out[value_col], errors="coerce")
+    out = out[[c for c in ("date", *value_cols, "source") if c in out.columns]]
+    present_values = [col for col in value_cols if col in out.columns]
+    return (out.dropna(subset=["date"]).dropna(subset=present_values, how="all")
+            .sort_values("date").reset_index(drop=True))
 
 
 def aggregate_main_force(daily: pd.DataFrame) -> dict[str, pd.DataFrame]:

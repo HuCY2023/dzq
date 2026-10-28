@@ -56,7 +56,10 @@ def check_main_force(mf: pd.DataFrame) -> dict[str, Any]:
         return _empty("main_force")
     x = mf.copy()
     x["净额_亿元"] = pd.to_numeric(x.get("净额_亿元"), errors="coerce")
+    latest_date = pd.to_datetime(x["date"], errors="coerce").max() if "date" in x.columns else pd.NaT
     x = x.dropna(subset=["净额_亿元"])
+    if x.empty:
+        return {"id": "main_force", "stable": None, "note": "缺少主力净额", "rows": 0}
     note = f"{len(x)} 日样本（东财窗口偏短属预期）"
     stable = len(x) >= 20
     extra: dict[str, Any] = {"rows": int(len(x))}
@@ -75,7 +78,11 @@ def check_main_force(mf: pd.DataFrame) -> dict[str, Any]:
                 note = "流入−流出≈净额"
     extra["last"] = float(x["净额_亿元"].iloc[-1])
     if "date" in x.columns:
-        extra["last_date"] = str(pd.to_datetime(x["date"].iloc[-1]).date())
+        last_valid = pd.to_datetime(x["date"], errors="coerce").max()
+        extra["last_date"] = str(last_valid.date())
+        if pd.notna(latest_date) and latest_date > last_valid:
+            stable = False
+            note += f"；净额有效至 {last_valid.date()}，{latest_date.date()} 净额缺失"
     return _ok({"id": "main_force"}, stable=stable, note=note, **extra)
 
 
@@ -90,7 +97,7 @@ def check_northbound(nb: pd.DataFrame) -> dict[str, Any]:
     stale = bool(last is not None and last < pd.Timestamp("2024-09-01"))
     note = f"{len(x)} 日有效净买"
     if stale:
-        note += f" · 有效至 {last.date()}（之后东财字段多为空，属已知缺口）"
+        note += f" · 历史净买有效至 {last.date()}；2024-08-19 起披露机制变化"
     return _ok(
         {"id": "northbound", "rows": int(len(x))},
         stable=len(x) >= 100,
@@ -143,12 +150,27 @@ def check_etf(etf_daily: pd.DataFrame, etf_hist: pd.DataFrame | None = None) -> 
     x = x.dropna(subset=[col])
     neg = int((x[col] <= 0).sum())
     codes = 0
+    coverage_note = ""
+    source_status = None
     if etf_hist is not None and not getattr(etf_hist, "empty", True) and "code" in etf_hist.columns:
+        from data_source.dp_cycle.national_team_etf import CORE_CSI300
+
         codes = int(etf_hist["code"].nunique())
+        if "date" in etf_hist.columns and col in etf_hist.columns:
+            hist = etf_hist.copy()
+            hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
+            hist[col] = pd.to_numeric(hist[col], errors="coerce")
+            hist = hist.dropna(subset=["date", "code", col])
+            if not hist.empty:
+                latest = hist.loc[hist["date"] == hist["date"].max(), "code"].astype(str).str.zfill(6)
+                current = set(latest) & set(CORE_CSI300)
+                coverage_note = f" · 最近覆盖 {len(current)}/{len(CORE_CSI300)} 只"
+                source_status = "partial" if len(current) < len(CORE_CSI300) else None
     return _ok(
         {"id": "etf", "rows": int(len(x)), "codes": codes},
         stable=neg == 0 and len(x) >= 5,
-        note=f"{len(x)} 个周末点" + (f" · {codes} 只ETF" if codes else "") + "（份额代理≠汇金/证金）",
+        note=f"{len(x)} 个周末点" + (f" · {codes} 只ETF" if codes else "") + coverage_note + "（份额代理≠汇金/证金）",
+        source_status=source_status,
         last=float(x[col].iloc[-1]),
         last_date=str(pd.to_datetime(x["date"].iloc[-1]).date()) if "date" in x.columns else None,
     )
@@ -160,6 +182,8 @@ def check_margin(margin: pd.DataFrame, *, live: bool = False) -> dict[str, Any]:
     x = margin.copy()
     x["融资余额_亿元"] = pd.to_numeric(x.get("融资余额_亿元"), errors="coerce")
     x = x.dropna(subset=["融资余额_亿元"])
+    if x.empty:
+        return _empty("margin")
     # 表内：融资 ≤ 两融（若有）
     note = f"{len(x)} 日"
     stable = len(x) >= 200
@@ -388,6 +412,7 @@ def validate_tables(tables: dict[str, Any], *, live: bool = False) -> dict[str, 
                 "stable": st,
                 "note": it.get("note") or "",
                 "rows": it.get("rows"),
+                "source_status": "historical" if sid == "northbound" and it.get("stale_after_2024q3") else it.get("source_status"),
             }
         )
 
@@ -395,7 +420,8 @@ def validate_tables(tables: dict[str, Any], *, live: bool = False) -> dict[str, 
     ok_n = sum(1 for b in scored if b["stable"] is True)
     bad_n = sum(1 for b in scored if b["stable"] is False)
     overall = "ok" if bad_n == 0 and ok_n >= 4 else ("warn" if bad_n <= 1 else "fail")
-    summary = f"交叉验证 {ok_n}/{len(scored)} 通过"
+    scope = "一致性与来源核对" if live else "表内一致性检查"
+    summary = f"{scope} {ok_n}/{len(scored)} 通过"
     if bad_n:
         summary += f" · {bad_n} 项告警"
     return {

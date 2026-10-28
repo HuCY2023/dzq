@@ -16,8 +16,8 @@ from data_source.dp_cycle.diagnosis import (
     diagnose_position,
     score_margin_regime,
     score_national_team_regime,
-    _as_pct,
 )
+from data_source.dp_cycle.margin import causal_margin_frame
 from data_source.dp_cycle.rules import NT_SHORT_WINDOW
 
 
@@ -32,7 +32,7 @@ def cov(name, df):
     return f"{name}: n={n} {d0}~{d1}"
 
 
-def main() -> None:
+def main() -> int:
     b = load_dp_cycle_gui_bundle(refresh=False)
     d = diagnose_position(b)
     issues: list[str] = []
@@ -71,13 +71,16 @@ def main() -> None:
     nt = next(i for i in d["items"] if i["id"] == "national_team")
     mg = next(i for i in d["items"] if i["id"] == "margin")
 
-    if nt.get("zone") == "high" and nt.get("trend") == "out" and d["decision"]["id"] != "exit":
+    actionable = d["decision"]["id"] != "insufficient_data"
+    if (d.get("rule_version") == "author_v1" and actionable and nt.get("status") == "ok"
+            and nt.get("zone") == "high" and nt.get("trend") == "out" and d["decision"]["id"] != "exit"):
         issues.append("FAIL: NT high out should be exit")
-    if mg.get("zone") == "high" and mg.get("trend") == "up" and d["decision"]["id"] not in ("exit", "reduce"):
+    if actionable and mg.get("status") == "ok" and mg.get("zone") == "high" and mg.get("trend") == "up" and d["decision"]["id"] not in ("exit", "reduce"):
         issues.append("FAIL: margin high up should reduce/exit")
-    if mg.get("zone") == "high" and mg.get("trend") == "down" and d["decision"]["id"] not in ("exit", "reduce"):
+    if actionable and mg.get("status") == "ok" and mg.get("zone") == "high" and mg.get("trend") == "down" and d["decision"]["id"] not in ("exit", "reduce"):
         issues.append("FAIL: margin high down should reduce")
-    s = sum(int(i["score"]) for i in d["items"] if i["score"] is not None)
+    scored = [int(i["score"]) for i in d["items"] if i["status"] == "ok" and i["score"] is not None]
+    s = sum(scored) if scored else None
     if s != d["score"]:
         issues.append(f"FAIL: score sum {s} != {d['score']}")
     if d["decision"]["equity_text"] != d["position"]["equity_text"]:
@@ -105,18 +108,26 @@ def main() -> None:
         delta = float(pd.to_numeric(e["月变动_亿份"], errors="coerce").iloc[-1])
         sc, z, t, _tag = score_national_team_regime(pct, delta)
         print(f"\nNT recalc: shares={shares:.1f} pct_all={pct_all:.1f} pct_short={pct_short:.1f} -> pct={pct:.1f} delta={delta:+.1f} -> {sc} {z} {t}")
-        if sc != nt["score"] or z != nt.get("zone"):
+        if nt.get("status") == "ok" and (sc != nt["score"] or z != nt.get("zone")):
             issues.append(f"FAIL: NT mismatch {nt['score']}/{nt.get('zone')} vs {sc}/{z}")
 
-    m = b["margin"].dropna(subset=["融资余额_亿元"])
-    last = m.iloc[-1]
-    prev = m.iloc[-21]
-    delta = float(last["融资余额_亿元"] - prev["融资余额_亿元"])
-    pct = _as_pct(float(last["分位_全样本"]))
-    sc, z, t, _tag = score_margin_regime(pct, delta)
-    print(f"Margin recalc: bal={last['融资余额_亿元']:.0f} pct={pct:.1f} delta21={delta:+.0f} -> {sc} {z} {t}")
-    if sc != mg["score"] or z != mg.get("zone"):
-        issues.append(f"FAIL: Margin mismatch {mg['score']}/{mg.get('zone')} vs {sc}/{z}")
+    pct, t = None, None
+    margin = b.get("margin")
+    m = causal_margin_frame(margin, as_of=(b.get("meta") or {}).get("as_of"),
+                            trade_calendar=b.get("trade_calendar"))
+    if not m.empty and pd.notna(m["融资余额_亿元"].iloc[-1]) and pd.notna(m["融资_20交易日变化_亿元"].iloc[-1]):
+        last = m.iloc[-1]
+        values = m["融资余额_亿元"].dropna()
+        balance = float(last["融资余额_亿元"])
+        pct = float(((values < balance).sum() + ((values == balance).sum() + 1) / 2) / len(values) * 100)
+        delta = float(last["融资_20交易日变化_亿元"])
+        sc, z, t, _tag = score_margin_regime(pct, delta)
+        print(f"Margin recalc: bal={balance:.0f} pct={pct:.1f} delta20={delta:+.0f} -> {sc} {z} {t}")
+        if mg.get("status") == "ok" and (sc != mg["score"] or z != mg.get("zone")
+                                         or abs(pct - mg["pct"]) > 1e-8 or abs(delta - mg["delta_20"]) > 1e-8):
+            issues.append(f"FAIL: Margin mismatch {mg['score']}/{mg.get('zone')} vs {sc}/{z}")
+    else:
+        print("Margin recalc: 数据不足")
 
     # Precision notes
     print("\n=== PRECISION NOTES ===")
@@ -150,7 +161,8 @@ def main() -> None:
     print("\n=== ISSUES ===")
     print("\n".join(issues) if issues else "none (path checks passed)")
     print("\ngaps:", " | ".join(d["gaps"]))
+    return 1 if any(issue.startswith("FAIL:") for issue in issues) else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

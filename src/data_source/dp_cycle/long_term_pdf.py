@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import textwrap
 from datetime import datetime
 from typing import Any
 
@@ -27,8 +28,8 @@ def _footer(ax: plt.Axes, page: int, total: int, as_of: str) -> None:
     ax.text(
         0.5,
         0.02,
-        f"大周期五项指标 · 长期跟踪  |  数据截至 {as_of}  |  {page}/{total}",
-        transform=ax.transAxes,
+        f"大周期五项指标 · 长期跟踪  |  分析日期 {as_of}  |  各项数据日期见明细  |  {page}/{total}",
+        transform=ax.figure.transFigure,
         ha="center",
         va="bottom",
         fontsize=8,
@@ -45,7 +46,7 @@ def _cover(pdf: PdfPages, *, as_of: str, diagnosis: dict[str, Any], total: int) 
     ax.axis("off")
     ax.add_patch(plt.Rectangle((0, 0.78), 1, 0.22, color="#0f2744", transform=ax.transAxes, clip_on=False))
     ax.text(0.05, 0.90, "大周期 · 散户决策", fontsize=26, color="white", fontweight="bold", transform=ax.transAxes)
-    ax.text(0.05, 0.83, f"视频全量口径 · 长期跟踪  ·  截至 {as_of}", fontsize=12, color="#c5d4e8", transform=ax.transAxes)
+    ax.text(0.05, 0.83, f"视频全量口径 · 长期跟踪  ·  分析日期 {as_of}", fontsize=12, color="#c5d4e8", transform=ax.transAxes)
 
     pos = diagnosis.get("position") or {}
     dec = diagnosis.get("decision") or {}
@@ -106,26 +107,29 @@ def _cover(pdf: PdfPages, *, as_of: str, diagnosis: dict[str, Any], total: int) 
     for i, nd in enumerate(nodes):
         r, c = divmod(i, cols)
         x0 = 0.05 + c * 0.31
-        y0 = 0.24 - r * 0.12
+        y0 = 0.22 - r * 0.18
         st = nd.get("status") or "gap"
         edge = {"on": "#c45c26", "watch": "#c9a227", "off": "#2f5a42", "gap": "#d0d7e2"}.get(st, "#d0d7e2")
         face = {"on": "#f8e8e4", "watch": "#f7f0d8", "off": "#e8f3ec", "gap": "#f5f7fa"}.get(st, "#f5f7fa")
-        ax.add_patch(plt.Rectangle((x0, y0 - 0.02), 0.29, 0.10, facecolor=face, edgecolor=edge, transform=ax.transAxes))
+        ax.add_patch(plt.Rectangle((x0, y0 - 0.08), 0.29, 0.16, facecolor=face, edgecolor=edge, transform=ax.transAxes))
         ax.text(x0 + 0.01, y0 + 0.05, nd.get("title") or "", fontsize=10, fontweight="bold", color="#222", transform=ax.transAxes)
-        ax.text(x0 + 0.01, y0 + 0.01, nd.get("text") or "", fontsize=8, color="#444", transform=ax.transAxes)
+        ax.text(x0 + 0.01, y0 + 0.015, textwrap.fill(nd.get("text") or "", 30), va="top", fontsize=8, color="#444", transform=ax.transAxes)
 
     _footer(ax, 1, total, as_of)
     _page(fig, pdf)
 
 
-def _score_page(pdf: PdfPages, *, as_of: str, diagnosis: dict[str, Any], page: int, total: int) -> None:
+def _score_page(
+    pdf: PdfPages, *, as_of: str, diagnosis: dict[str, Any],
+    items: list[dict[str, Any]], page: int, total: int,
+) -> None:
     fig = plt.figure(figsize=PAGE)
     ax = fig.add_axes([0.04, 0.08, 0.92, 0.86])
     ax.axis("off")
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.text(0.0, 0.96, "打分明细 · 每项规则", fontsize=16, fontweight="bold", color="#0f2744", transform=ax.transAxes)
-    ax.text(0.0, 0.91, diagnosis.get("score_logic") or "", fontsize=9, color="#555", transform=ax.transAxes)
+    ax.text(0.0, 0.91, textwrap.fill(diagnosis.get("score_logic") or "", 100), fontsize=8, color="#555", transform=ax.transAxes)
 
     y = 0.86
     ax.text(0.0, y, "项", fontsize=8, color="#666", transform=ax.transAxes)
@@ -133,28 +137,27 @@ def _score_page(pdf: PdfPages, *, as_of: str, diagnosis: dict[str, Any], page: i
     ax.text(0.16, y, "当前读数", fontsize=8, color="#666", transform=ax.transAxes)
     ax.text(0.58, y, "打分规则", fontsize=8, color="#666", transform=ax.transAxes)
     y -= 0.035
-    for it in diagnosis.get("items") or []:
+    for it in items:
         sc = it.get("score")
-        sc_txt = "缺" if sc is None else f"{int(sc):+d}"
+        status_text = {"info": "观察", "stale": "陈旧", "partial": "部分覆盖"}.get(it.get("status"))
+        sc_txt = status_text or ("缺" if sc is None else f"{int(sc):+d}")
         tone = "#7a2e22" if isinstance(sc, (int, float)) and sc < 0 else ("#0f6e56" if isinstance(sc, (int, float)) and sc > 0 else "#666")
         ax.text(0.0, y, it.get("label") or "", fontsize=10, fontweight="bold", color="#222", transform=ax.transAxes)
         ax.text(0.10, y, sc_txt, fontsize=11, fontweight="bold", color=tone, transform=ax.transAxes)
-        ax.text(0.16, y, it.get("note") or "", fontsize=8, color="#333", transform=ax.transAxes, wrap=True)
-        ax.text(0.58, y, it.get("rule") or "", fontsize=8, color="#555", transform=ax.transAxes, wrap=True)
+        ax.text(0.16, y, textwrap.fill((it.get("note") or "").replace("≫", ">>"), 38), va="top", fontsize=8, color="#333", transform=ax.transAxes)
+        ax.text(0.58, y, textwrap.fill(it.get("rule") or "", 38), va="top", fontsize=8, color="#555", transform=ax.transAxes)
         y -= 0.09
-        if y < 0.18:
-            break
 
     red = diagnosis.get("red_light") or {}
     flags = red.get("flags") or []
     if flags:
         bits = " · ".join(
-            f"{f.get('label')}({'亮' if f.get('on') else '灭'})" for f in flags
+            f"{f.get('label')}({'未知' if f.get('status') == 'unknown' or f.get('on') is None else '亮' if f.get('on') else '灭'})" for f in flags
         )
         ax.text(0.0, 0.16, "红灯：" + bits, fontsize=8, color="#7a2e22", transform=ax.transAxes)
     gaps = diagnosis.get("gaps") or []
     if gaps:
-        ax.text(0.0, 0.11, "缺口：" + "；".join(str(g) for g in gaps[:4]), fontsize=8, color="#666", transform=ax.transAxes)
+        ax.text(0.0, 0.11, textwrap.fill("缺口：" + "；".join(str(g) for g in gaps[:4]), 100), va="top", fontsize=8, color="#666", transform=ax.transAxes)
     _footer(ax, page, total, as_of)
     _page(fig, pdf)
 
@@ -210,11 +213,13 @@ def _position_page(pdf: PdfPages, *, as_of: str, diagnosis: dict[str, Any], page
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     pos = diagnosis.get("position") or {}
+    score = diagnosis.get("score")
+    score_text = "—" if score is None else f"{int(score):+d}"
     ax.text(0.0, 0.96, "仓位带 · 资金行为路径", fontsize=16, fontweight="bold", color="#0f2744", transform=ax.transAxes)
     ax.text(
         0.0,
         0.90,
-        f"{diagnosis.get('state') or '—'}    可见项 {diagnosis.get('score', '—'):+d}    当前 {pos.get('equity_text') or '—'}  ·  {pos.get('actor') or ''}",
+        f"{diagnosis.get('state') or '—'}    可见项 {score_text}    当前 {pos.get('equity_text') or '—'}  ·  {pos.get('actor') or ''}",
         fontsize=11,
         color="#222",
         transform=ax.transAxes,
@@ -262,29 +267,37 @@ def _position_page(pdf: PdfPages, *, as_of: str, diagnosis: dict[str, Any], page
     _page(fig, pdf)
 
 
-def _method_page(pdf: PdfPages, *, as_of: str, page: int, total: int) -> None:
+def _method_page(pdf: PdfPages, *, as_of: str, page: int, total: int, rule_version: str = "improved_v1",
+                 holder_note: str = "", turnover_note: str = "") -> None:
     fig = plt.figure(figsize=PAGE)
     ax = fig.add_axes([0.06, 0.08, 0.88, 0.86])
     ax.axis("off")
     ax.set_title("口径 · 数据源 · 使用说明", fontsize=16, loc="left", color="#0f2744", pad=10)
 
+    author = rule_version == "author_v1"
     lines = [
         "视频口径：资金侧边际变差共振 → 打分 → 散户五档决策。日常 ±1/±2；多项同负才极端（如 −9）。",
-        "A 资金三件套：主力（只作风控）· 郭嘉队ETF份额代理（≠汇金净流入）· 融资分位×方向。",
-        "B 行为：成长–价值偏离≈17；52周高低比热~10:1 / 空~1:10（湖扫未剔 ST）。",
+        "A 资金三件套：主力（只作风控）· 宽基ETF份额代理（不可识别持有人）· 融资分位×方向。",
+        "B 行为：成长–价值偏离≈17；高低比热~10:1 / 空~1:10。本机广度默认乐咕120日，≠作者52周。",
         "C 解禁：提前约一年；高峰后 2–3 月主力易偏高。",
-        "D −9 扩展：剪刀差 / 公募新发腰斩 / 减持+75% / 科技流出银行不接（有数才进分）。",
+        ("D 扩展：剪刀差可计分；公募、减持、行业项按数据覆盖判断。" if author else
+         "D 扩展：剪刀差仅观察，公募新发仅观察；减持和行业按覆盖判断。"),
         "E 旁证：A股成交拥挤度、科创IV、美股保证金/M2（默认不进合计分）。",
         "红灯四件套：偏离极值 + 高低比背离 + 高杠杆 + 外盘脆弱；扳机仍是资金边际。",
-        "决策：硬信号优先（郭嘉队高位减→离场；融资高位加/杀→减仓）。缺的不记 0。",
+        ("决策：关键数据不足不输出仓位；作者版允许ETF份额代理参与仓位。" if author else
+         "决策：关键数据不足不输出仓位；ETF份额代理不独立决定仓位。"),
         "权威：research/DP/大周期/框架.md · 散户决策_推演核查.md",
         "",
-        "入库：scripts/research/update_dp_cycle_db.py 或每日 run_dp_cycle_daily.py",
+        "更新报告：双击 update-local.cmd，或运行 scripts/build_web_report.py --refresh --pdf。",
         "稳定 PDF：output/user/dp_cycle/大周期五项指标_长期跟踪.pdf",
         "",
         "免责声明：",
         DISCLAIMER_BODY_CN,
     ]
+    if holder_note:
+        lines.insert(2, holder_note)
+    if turnover_note:
+        lines.insert(3, turnover_note)
     y = 0.92
     for line in lines:
         ax.text(0.0, y, line, fontsize=9, color="#333", transform=ax.transAxes, va="top")
@@ -308,24 +321,23 @@ def build_long_term_pdf(
     meta: dict[str, Any],
     pngs: dict[str, str],
     tables: dict[str, pd.DataFrame] | None = None,
+    diagnosis: dict[str, Any] | None = None,
     latest_copy: str | None = None,
 ) -> str:
     """生成正式长期跟踪 PDF；可选同步到稳定路径。"""
     setup_matplotlib_chinese()
     tables = tables or {}
     ind = meta.get("indicators") or {}
-    as_of = (
-        ind.get("03_margin", {}).get("last_date")
-        or ind.get("04_growth_value", {}).get("last_date")
-        or ind.get("05_high_low", {}).get("last_date")
-        or datetime.now().strftime("%Y-%m-%d")
-    )
+    as_of = (tables.get("meta") or {}).get("as_of") or datetime.now().strftime("%Y-%m-%d")
 
     mf = ind.get("01_main_force") or {}
     etf = ind.get("02_national_team") or {}
     mg = ind.get("03_margin") or {}
     gv = ind.get("04_growth_value") or {}
     hl = ind.get("05_high_low") or {}
+    from data_source.dp_cycle.gui_bundle import _high_low_captions
+
+    breadth_captions = _high_low_captions(tables.get("high_low"))
 
     # ETF 最新合计
     etf_sum = "—"
@@ -334,6 +346,19 @@ def build_long_term_pdf(
         last_d = pd.to_datetime(etf_df["date"]).max()
         etf_sum = _fmt_num(etf_df.loc[pd.to_datetime(etf_df["date"]) == last_d, "份额_亿份"].sum(), 2) + " 亿份"
 
+    all_ready = all(v.get("ok") and not v.get("partial") for v in ind.values())
+    etf_coverage = etf.get("coverage") or {}
+    etf_sub = "≠汇金/证金身份"
+    if etf_coverage.get("current_count") is not None:
+        etf_sub = f"覆盖 {etf_coverage['current_count']}/{etf_coverage.get('expected_count', '?')} 只 · " + etf_sub
+    etf_flow = tables.get("etf_flow") or {}
+    flow_coverage = etf_flow.get("coverage") or {}
+    if etf_flow.get("date") and etf_flow.get("flow_yi") is not None:
+        etf_sum = f"{float(etf_flow['flow_yi']):+.2f} 亿（估算）"
+        etf_sub = (f"{etf_flow['date']} · {flow_coverage.get('comparable', 0)}/"
+                   f"{flow_coverage.get('expected', 4)}只 · 非实际现金流")
+        if (etf_flow.get("source") or {}).get("events_recorded") is False:
+            etf_sub += " · 事件表未留存"
     cards = [
         {
             "title": "01 主力资金",
@@ -344,13 +369,13 @@ def build_long_term_pdf(
         {
             "title": "02 ETF 份额代理",
             "value": etf_sum,
-            "sub": "≠汇金/证金身份",
+            "sub": etf_sub,
             "color": "#0f2744",
         },
         {
             "title": "03 融资余额",
             "value": f"{_fmt_num(mg.get('last_融资余额_亿元'), 0)} 亿",
-            "sub": f"分位窗口近{mg.get('lookback_years', 5)}年",
+            "sub": "融资余额 · 截至当期历史分位",
             "color": "#0f2744",
         },
         {
@@ -362,52 +387,41 @@ def build_long_term_pdf(
         {
             "title": "05 广度",
             "value": f"{hl.get('last_新高', '—')}−{hl.get('last_新低', '—')}",
-            "sub": "52周新高家数 − 新低家数",
+            "sub": breadth_captions[2],
             "color": "#f4664a" if int(hl.get("last_新低") or 0) > int(hl.get("last_新高") or 0) else "#0f6e56",
         },
         {
             "title": "数据状态",
-            "value": "五项就绪" if all(v.get("ok") for v in ind.values()) else "部分失败",
+            "value": "五项就绪" if all_ready else "部分覆盖或缺失",
             "sub": "详见 scan_meta.txt",
-            "color": "#0f6e56" if all(v.get("ok") for v in ind.values()) else "#f4664a",
+            "color": "#0f6e56" if all_ready else "#f4664a",
         },
     ]
 
     chart_specs = [
         ("01_main_force", "01 主力资金", "东财大单+超大单净额 · 月/周；作者线仅对照"),
-        ("02_national_team", "02 国家队资金代理", "宽基 ETF 份额变动 · 申赎代理，≠汇金证金"),
+        ("02_national_team", "02 核心宽基ETF份额代理", "宽基 ETF 份额变动 · 不能识别持有人"),
         ("03_margin", "03 杠杆资金（两融）", "沪深融资余额 · 月变化 · 历史分位"),
         ("04_growth_value", "04 成长–价值偏离度", "(PE比+PB比)/2 · 创业板50 vs 上证50"),
-        ("05_high_low", "05 52周新高−新低", "本地K线湖广度 · 未剔ST"),
+        ("05_high_low", breadth_captions[2], breadth_captions[1]),
     ]
     from data_source.dp_cycle.diagnosis import diagnose_position
 
-    diagnosis = diagnose_position(
-        {
-            "weekly": tables.get("weekly"),
-            "main_force_daily": tables.get("main_force_daily"),
-            "margin": tables.get("margin"),
-            "growth_value": tables.get("growth_value"),
-            "high_low": tables.get("high_low"),
-            "unlock_daily": tables.get("unlock_daily"),
-            "etf_monthly": tables.get("etf_monthly") or tables.get("etf_shares_daily"),
-            "fund_issue": tables.get("fund_issue"),
-            "holder_reduce": tables.get("holder_reduce"),
-            "industry_flow_daily": tables.get("industry_flow_daily"),
-            "us_crowding": tables.get("us_crowding") if isinstance(tables.get("us_crowding"), dict) else None,
-        },
-        heavy=True,
-    )
-    # cover + score + position + dashboard + charts + method
-    total = 4 + len(chart_specs) + 1
+    if diagnosis is None:
+        diagnosis = diagnose_position(tables, heavy=True, as_of=as_of)
+    items = diagnosis["items"]
+    score_groups = [items[i:i + 7] for i in range(0, len(items), 7)]
+    # cover + score pages + position + dashboard + charts + method
+    total = 4 + len(score_groups) + len(chart_specs)
 
     os.makedirs(os.path.dirname(out_pdf) or ".", exist_ok=True)
     with PdfPages(out_pdf) as pdf:
         _cover(pdf, as_of=str(as_of), diagnosis=diagnosis, total=total)
-        _score_page(pdf, as_of=str(as_of), diagnosis=diagnosis, page=2, total=total)
-        _position_page(pdf, as_of=str(as_of), diagnosis=diagnosis, page=3, total=total)
-        _dashboard(pdf, as_of=str(as_of), cards=cards, total=total, page=4)
-        for i, (key, title, blurb) in enumerate(chart_specs, start=5):
+        for page, score_items in enumerate(score_groups, start=2):
+            _score_page(pdf, as_of=str(as_of), diagnosis=diagnosis, items=score_items, page=page, total=total)
+        _position_page(pdf, as_of=str(as_of), diagnosis=diagnosis, page=2 + len(score_groups), total=total)
+        _dashboard(pdf, as_of=str(as_of), cards=cards, total=total, page=3 + len(score_groups))
+        for i, (key, title, blurb) in enumerate(chart_specs, start=4 + len(score_groups)):
             _chart_page(
                 pdf,
                 pngs.get(key, ""),
@@ -417,7 +431,14 @@ def build_long_term_pdf(
                 page=i,
                 total=total,
             )
-        _method_page(pdf, as_of=str(as_of), page=total, total=total)
+        turnover = tables.get("turnover_observation") or {}
+        turnover_note = ""
+        if turnover.get("date"):
+            turnover_note = (f"本地成交 {turnover['date']}：{turnover['stocks']} 只，前5%占 "
+                             f"{turnover['shares_pct']['5']:.2f}%，{turnover['top5_amount_yi']:.2f} 亿元；部分覆盖，仅观察。")
+        _method_page(pdf, as_of=str(as_of), page=total, total=total,
+                     rule_version=diagnosis.get("rule_version") or "improved_v1",
+                     holder_note=(tables.get("etf_holder_disclosures") or {}).get("pdf_note", ""), turnover_note=turnover_note)
 
     if latest_copy:
         os.makedirs(os.path.dirname(latest_copy) or ".", exist_ok=True)

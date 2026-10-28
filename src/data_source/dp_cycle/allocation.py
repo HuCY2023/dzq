@@ -26,6 +26,7 @@ from data_source.dp_cycle.rules import (  # noqa: E402
     score_divergence,
     score_margin_regime,
     score_national_team_regime,
+    validate_rule_version,
 )
 
 # 五档决策（页面首屏）
@@ -185,13 +186,15 @@ def choose_phase(
     mf_score: int | None = None,
     nt_score: int | None = None,
     leverage: int | None = None,  # 兼容旧调用：仅作弱后备
+    rule_version: str = "improved_v1",
 ) -> str:
     """把已有打分落到资金行为图的某一段。郭嘉队仓位优先，融资看分位×方向。"""
-    if nt_zone == "high" and nt_trend == "out":
+    validate_rule_version(rule_version)
+    if rule_version == "author_v1" and nt_zone == "high" and nt_trend == "out":
         return "nt_sell"
-    if nt_zone == "low" and nt_trend == "in":
+    if rule_version == "author_v1" and nt_zone == "low" and nt_trend == "in":
         return "nt_buy"
-    if nt_zone == "high" and nt_trend in {"in", "flat"}:
+    if rule_version == "author_v1" and nt_zone == "high" and nt_trend in {"in", "flat"}:
         return "retail_up"
     if margin_zone == "high" and margin_trend == "up":
         return "retail_up"
@@ -207,7 +210,7 @@ def choose_phase(
         return "margin_down"
     if mf_score is not None and mf_score <= -2 and margin_zone == "high":
         return "margin_down"
-    if nt_score is not None and nt_score <= -2:
+    if rule_version == "author_v1" and nt_score is not None and nt_score <= -2:
         return "nt_sell"
     # 旧参数兜底
     if leverage is not None and leverage <= -2:
@@ -230,7 +233,10 @@ _BASIS = {
 }
 
 
-def allocation_view(phase_id: str, *, partial: bool) -> dict[str, Any]:
+def allocation_view(phase_id: str, *, partial: bool, rule_version: str = "improved_v1") -> dict[str, Any]:
+    validate_rule_version(rule_version)
+    if rule_version != "author_v1" and phase_id in {"nt_buy", "nt_sell"}:
+        phase_id = "unclear"
     row = phase_by_id(phase_id)
     low, high = int(row["equity_low"]), int(row["equity_high"])
     note = row["sleeve"]
@@ -245,7 +251,11 @@ def allocation_view(phase_id: str, *, partial: bool) -> dict[str, Any]:
         "equity_high": high,
         "equity_text": f"{low}–{high}%" if low != high else f"{low}%",
         "sleeve": note,
-        "basis": _BASIS.get(row["id"], "这项没有直接序列"),
+        "basis": (
+            {"retail_up": "融资高位拥挤，过热段", "unclear": "融资与行为指标未落到明确阶段"}.get(row["id"])
+            if rule_version != "author_v1" and row["id"] in {"retail_up", "unclear"}
+            else _BASIS.get(row["id"], "这项没有直接序列")
+        ),
         "decision": row.get("decision") or "hold",
     }
 
@@ -259,9 +269,13 @@ def decide_retail_action(
     margin_trend: str,
     phase_id: str,
     behavior_bad: bool = False,
+    rule_version: str = "improved_v1",
 ) -> dict[str, Any]:
     """散户决策：硬信号优先，再看分数带。结论=离场/减仓/持有观望/加仓/抄底。"""
+    validate_rule_version(rule_version)
     reasons: list[str] = []
+    if rule_version != "author_v1" and phase_id in {"nt_buy", "nt_sell"}:
+        phase_id = "unclear"
     action_id = decide_retail_action_core(
         score=score,
         nt_zone=nt_zone,
@@ -269,6 +283,7 @@ def decide_retail_action(
         margin_zone=margin_zone,
         margin_trend=margin_trend,
         behavior_bad=behavior_bad,
+        rule_version=rule_version,
     )
     if action_id is None:
         # 落到资金行为阶段的默认决策
@@ -277,15 +292,15 @@ def decide_retail_action(
         reasons.append(f"落在资金行为「{phase.get('stage')}」段")
     else:
         # 硬信号原因
-        if action_id == "exit" and nt_zone == "high" and nt_trend == "out":
+        if rule_version == "author_v1" and action_id == "exit" and nt_zone == "high" and nt_trend == "out":
             reasons.append("郭嘉队高仓位还在减（最高优先）")
-        elif action_id == "reduce" and nt_zone == "high":
+        elif rule_version == "author_v1" and action_id == "reduce" and nt_zone == "high":
             reasons.append("郭嘉队高仓位拥挤/钝化，高位唱多段勿接")
         elif action_id == "exit" and margin_zone == "high" and margin_trend == "up":
             reasons.append("融资高位还在加，风险升，警惕离开")
         elif action_id == "reduce" and margin_zone == "high" and margin_trend == "down":
             reasons.append("融资高位去杠杆，杀杠杆未结束")
-        elif action_id == "bottom" and nt_zone == "low" and nt_trend == "in":
+        elif rule_version == "author_v1" and action_id == "bottom" and nt_zone == "low" and nt_trend == "in":
             reasons.append("郭嘉队低位加仓，托举段可抄底宽基")
         elif action_id == "add" and margin_zone == "low" and margin_trend == "up":
             reasons.append("融资低位加杠杆，跟随加仓")
@@ -330,16 +345,22 @@ def _as_of_month(frame: pd.DataFrame, value_cols: list[str]) -> pd.DataFrame:
     return out.groupby("date", as_index=False).last()
 
 
-def monthly_regimes(bundle: dict[str, Any]) -> list[dict[str, Any]]:
+def monthly_regimes(
+    bundle: dict[str, Any], *, rule_version: str = "improved_v1", as_of: Any | None = None
+) -> list[dict[str, Any]]:
     """每个月末用和当前诊断同一套窗口打分，相邻同阶段合并。"""
-    mcols = ["融资余额_亿元"]
+    validate_rule_version(rule_version)
+    from data_source.dp_cycle.margin import (
+        _margin_local_timestamps, causal_margin_frame, margin_signal_at, margin_signal_from_row,
+    )
+
     raw_m = bundle.get("margin") if isinstance(bundle.get("margin"), pd.DataFrame) else pd.DataFrame()
-    if isinstance(raw_m, pd.DataFrame) and "分位_全样本" in getattr(raw_m, "columns", []):
-        mcols.append("分位_全样本")
-    margin = _as_of_month(raw_m, mcols)
+    if "available_at" in raw_m.columns:
+        raw_m = raw_m.copy()
+        raw_m["available_at"] = _margin_local_timestamps(raw_m["available_at"])
+    margin = causal_margin_frame(raw_m, as_of=as_of, trade_calendar=bundle.get("trade_calendar"))
     if margin.empty or "融资余额_亿元" not in margin.columns:
         return []
-    margin = margin.dropna(subset=["融资余额_亿元"]).reset_index(drop=True)
 
     div = _as_of_month(bundle.get("growth_value") if isinstance(bundle.get("growth_value"), pd.DataFrame) else pd.DataFrame(), ["偏离度"])
     hl = _as_of_month(
@@ -347,7 +368,6 @@ def monthly_regimes(bundle: dict[str, Any]) -> list[dict[str, Any]]:
         ["new_high", "new_low"],
     )
     month_last = margin.groupby(margin["date"].dt.to_period("M"), as_index=False).tail(1)
-    from data_source.dp_cycle.diagnosis import _as_pct
 
     etf_m = bundle.get("etf_monthly") if isinstance(bundle.get("etf_monthly"), pd.DataFrame) else pd.DataFrame()
     etf = pd.DataFrame()
@@ -363,28 +383,38 @@ def monthly_regimes(bundle: dict[str, Any]) -> list[dict[str, Any]]:
     for end in month_last["date"]:
         end = pd.Timestamp(end).normalize()
         loc = int(margin.index[margin["date"] == end][-1])
-        if loc < 21:
+        latest = margin.loc[loc]
+        released = pd.to_datetime(latest.get("available_at"), errors="coerce")
+        missing_visible = pd.isna(latest["融资余额_亿元"]) and (pd.isna(released) or released <= end)
+        signal = (margin_signal_from_row(latest) if missing_visible else
+                  margin_signal_at(raw_m, as_of=end, trade_calendar=bundle.get("trade_calendar"))
+                  if "available_at" in margin.columns else margin_signal_from_row(latest))
+        if signal["status"] != "ok":
+            view = allocation_view("unclear", partial=True, rule_version=rule_version)
+            rows.append({"date": end.strftime("%Y-%m-%d"), "phase_id": "unclear", "stage": "数据不足",
+                         "actor": view["actor"], "side": view["side"], "equity_text": "",
+                         "basis": signal["reason"], "leverage": None, "margin_status": signal["status"],
+                         "margin_pct": None, "margin_delta_20": None, "margin_observation_date": None})
             continue
-        delta = float(margin.loc[loc, "融资余额_亿元"] - margin.loc[loc - 21, "融资余额_亿元"])
-        pct_raw = margin.loc[loc].get("分位_全样本") if "分位_全样本" in margin.columns else None
-        pct_v = _as_pct(float(pct_raw) if pd.notna(pct_raw) else None)
-        lev, m_zone, m_trend, _ = score_margin_regime(pct_v, delta)
+        lev, m_zone, m_trend = signal["score"], signal["zone"], signal["trend"]
 
         nt_zone, nt_trend, nt_score = "gap", "flat", None
-        if not etf.empty:
+        if rule_version == "author_v1" and not etf.empty:
             past_e = etf.loc[etf["date"] <= end]
-            if len(past_e) >= 6:
+            consecutive = len(past_e) >= 2 and past_e["date"].iloc[-2].to_period("M") + 1 == past_e["date"].iloc[-1].to_period("M")
+            if len(past_e) >= 6 and consecutive:
                 shares = float(past_e["份额_亿份"].iloc[-1])
                 # 双轨分位
                 pct_all = float((past_e["份额_亿份"] <= shares).mean() * 100.0)
                 short_hist = past_e["份额_亿份"].tail(NT_SHORT_WINDOW)
                 pct_short = float((short_hist <= shares).mean() * 100.0) if len(short_hist) >= 12 else pct_all
                 pct_nt = max(pct_all, pct_short) if pct_all >= 50 else min(pct_all, pct_short)
-                if "月变动_亿份" in past_e.columns and pd.notna(past_e["月变动_亿份"].iloc[-1]):
-                    d_nt = float(past_e["月变动_亿份"].iloc[-1])
+                if "月变动_亿份" in past_e.columns:
+                    d_nt = float(past_e["月变动_亿份"].iloc[-1]) if pd.notna(past_e["月变动_亿份"].iloc[-1]) else None
                 else:
                     d_nt = shares - float(past_e["份额_亿份"].iloc[-2])
-                nt_score, nt_zone, nt_trend, _ = score_national_team_regime(pct_nt, d_nt)
+                if d_nt is not None:
+                    nt_score, nt_zone, nt_trend, _ = score_national_team_regime(pct_nt, d_nt)
 
         div_now = None
         div_prev = None
@@ -412,8 +442,9 @@ def monthly_regimes(bundle: dict[str, Any]) -> list[dict[str, Any]]:
             unlock_hot=False,
             mf_score=None,
             nt_score=nt_score,
+            rule_version=rule_version,
         )
-        view = allocation_view(phase_id, partial=True)
+        view = allocation_view(phase_id, partial=True, rule_version=rule_version)
         rows.append(
             {
                 "date": end.strftime("%Y-%m-%d"),
@@ -424,6 +455,10 @@ def monthly_regimes(bundle: dict[str, Any]) -> list[dict[str, Any]]:
                 "equity_text": view["equity_text"],
                 "basis": view["basis"],
                 "leverage": lev,
+                "margin_status": "ok",
+                "margin_pct": signal["pct"],
+                "margin_delta_20": signal["delta"],
+                "margin_observation_date": signal["date"].strftime("%Y-%m-%d"),
             }
         )
     if not rows:
@@ -433,8 +468,10 @@ def monthly_regimes(bundle: dict[str, Any]) -> list[dict[str, Any]]:
     cur["start"] = cur["date"]
     cur["end"] = cur["date"]
     for row in rows[1:]:
-        if row["phase_id"] == cur["phase_id"]:
+        if row["phase_id"] == cur["phase_id"] and row["margin_status"] == cur["margin_status"]:
             cur["end"] = row["date"]
+            for key in ("leverage", "margin_status", "margin_pct", "margin_delta_20", "margin_observation_date"):
+                cur[key] = row[key]
         else:
             segments.append(cur)
             cur = dict(row)
